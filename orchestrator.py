@@ -287,25 +287,33 @@ def main():
 
     # Step 1 — DEPLOYMENT (24-species target gallery): the experiments whose
     # research question is operational deployment. Trains SC-URD seeds once.
-    print("\n[1/8] Deployment experiments (id_only, 24 target species)...")
-    dep_dir = _engine_pass(
-        run_root, "deployment", "id_only",
-        {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING",
-         "RUN_REVIEWER_GAP_FULL_GALLERY", "RUN_RQ5_FULL_GALLERY",
-         "RUN_SCURD_SEED_SENSITIVITY", "RUN_TRAIN_SCURD_SEEDS"},
-        "variance (deployment / id_only)", src_research)
-    # Persist any newly-trained SC-URD seed checkpoints back to the source research dir
-    # so later runs (new FULL954_RUN_STAMP) reuse them instead of retraining.
-    for p in (dep_dir / "research_directions").glob(_SCURD_SEED_GLOB):
-        _copy_if_needed(p, src_research / p.name)
+    dep_dir = run_root / "deployment"
+    if os.environ.get("SKIP_DEPLOYMENT_PASS", "0") == "1":
+        print(f"\n[1/8] SKIP_DEPLOYMENT_PASS=1; reusing {dep_dir}")
+    else:
+        print("\n[1/8] Deployment experiments (id_only, 24 target species)...")
+        dep_dir = _engine_pass(
+            run_root, "deployment", "id_only",
+            {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING",
+             "RUN_REVIEWER_GAP_FULL_GALLERY", "RUN_RQ5_FULL_GALLERY",
+             "RUN_SCURD_SEED_SENSITIVITY", "RUN_TRAIN_SCURD_SEEDS"},
+            "variance (deployment / id_only)", src_research)
+        # Persist any newly-trained SC-URD seed checkpoints back to the source research dir
+        # so later runs (new FULL954_RUN_STAMP) reuse them instead of retraining.
+        for p in (dep_dir / "research_directions").glob(_SCURD_SEED_GLOB):
+            _copy_if_needed(p, src_research / p.name)
 
     # Step 2 — PARADIGM (matched 954-species gallery): RQ1 + matched-954 deployment
     # metrics for the appendix. Seeds already trained; not retrained here.
-    print("\n[2/8] Paradigm comparison (full_swi, matched 954 species)...")
-    para_dir = _engine_pass(
-        run_root, "paradigm", "full_swi",
-        {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING"},
-        "variance (paradigm / full_swi)", src_research)
+    para_dir = run_root / "paradigm"
+    if os.environ.get("SKIP_PARADIGM_PASS", "0") == "1":
+        print(f"\n[2/8] SKIP_PARADIGM_PASS=1; reusing {para_dir}")
+    else:
+        print("\n[2/8] Paradigm comparison (full_swi, matched 954 species)...")
+        para_dir = _engine_pass(
+            run_root, "paradigm", "full_swi",
+            {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING"},
+            "variance (paradigm / full_swi)", src_research)
 
     # Step 3 — review evidence. The matched-954 pass backs the statistical cleanup;
     # the deployment pass backs qualitative/failure-taxonomy discussion and optional
