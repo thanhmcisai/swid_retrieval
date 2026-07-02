@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.env
+.venv/
+venv/
+env/
+
+# Local run artifacts and generated caches
+results/
+paper_reframe/
+paper_reframe_full954*/
+checkpoints/
+research_directions/
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.partial
+*.partial.npz
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
