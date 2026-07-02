@@ -391,13 +391,24 @@ def load_paths_for_interpretability(gallery_mask):
         out["id_paths"] = id_df["file_path"].astype(str).values
     if manifest_path.exists():
         manifest = json.load(open(manifest_path))
-        # Must match the embedding-cache extraction order: the full-954 cache is
-        # extracted over meta-train ∪ meta-val ∪ meta-test, the legacy cache over
-        # meta-test only. Misalignment here silently corrupts confusion/failure rows.
-        if IS_FULL_GALLERY:
-            swi_items = manifest["meta-train"] + manifest["meta-val"] + manifest["meta-test"]
+        # Must match the embedding-cache extraction order, not the gallery scope.
+        # The corrected full-954 cache is extracted over meta-train ∪ meta-val ∪
+        # meta-test even when a later id_only pass masks it down to 24 species.
+        # Older legacy caches used meta-test only. Select by row count so path
+        # arrays stay aligned with labels_swi/gallery_mask in both cases.
+        full_items = manifest["meta-train"] + manifest["meta-val"] + manifest["meta-test"]
+        legacy_items = manifest["meta-test"]
+        if len(full_items) == len(gallery_mask):
+            swi_items = full_items
+        elif len(legacy_items) == len(gallery_mask):
+            swi_items = legacy_items
         else:
-            swi_items = manifest["meta-test"]
+            print(
+                "WARNING: cannot align SWI image paths with embedding cache "
+                f"(full={len(full_items)}, meta-test={len(legacy_items)}, "
+                f"mask={len(gallery_mask)}); interpretability paths disabled."
+            )
+            return out
         out["swi_paths"] = np.asarray([p for p, _ in swi_items])
         out["gal_paths"] = out["swi_paths"][gallery_mask]
     return out
