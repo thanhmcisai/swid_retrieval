@@ -74,6 +74,17 @@ SCURD_PROJ_CACHE = RESEARCH_DIR / os.environ.get(
 SCURD_MAIN_CKPT = RESEARCH_DIR / os.environ.get(
     "SCURD_MAIN_CKPT_NAME", f"sc_urd_checkpoint_scurd_r01_e20_{SC_URD_CACHE_VERSION}.pt")
 SCURD_MODE = os.environ.get("SCURD_MAIN_MODE", "centered").strip() or "centered"
+SCURD_TAU = float(os.environ.get("SCURD_TAU", "0.07"))
+SCURD_TOP_M = int(os.environ.get("SCURD_TOP_M", "50"))
+SCURD_BETA = float(os.environ.get("SCURD_BETA", "0.1"))
+SCURD_TRAIN_EPOCHS = int(os.environ.get("SCURD_TRAIN_EPOCHS", "20"))
+SCURD_TRAIN_EPISODES = int(os.environ.get("SCURD_TRAIN_EPISODES", "500"))
+SCURD_TRAIN_LAMBDA_CONS = float(os.environ.get("SCURD_TRAIN_LAMBDA_CONS", "0.5"))
+SCURD_TRAIN_LR = float(os.environ.get("SCURD_TRAIN_LR", "1e-3"))
+SCURD_WEIGHT_DECAY = float(os.environ.get("SCURD_WEIGHT_DECAY", "1e-4"))
+SCURD_N_WAY = int(os.environ.get("SCURD_N_WAY", "16"))
+SCURD_K_SUPPORT = int(os.environ.get("SCURD_K_SUPPORT", "5"))
+SCURD_Q_QUERY = int(os.environ.get("SCURD_Q_QUERY", "4"))
 
 # ── Build / run flags ────────────────────────────────────────────────────
 RUN_BUILD_FULL954 = os.environ.get("RUN_BUILD_FULL954", "1") == "1"

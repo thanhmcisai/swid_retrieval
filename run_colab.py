@@ -41,6 +41,8 @@ os.environ.setdefault("RQ3_INFER_BENCH_IMAGES", "64")
 os.environ.setdefault("RQ3_INFER_SEARCH_ITERS", "10")
 os.environ.setdefault("PRELOAD_TENSORS", "1")
 os.environ.setdefault("SCURD_MAIN_MODE", "centered")
+os.environ.setdefault("SCURD_TRAIN_LR", "1e-3")
+os.environ.setdefault("SCURD_TRAIN_LAMBDA_CONS", "0.5")
 
 from . import orchestrator  # noqa: E402
 

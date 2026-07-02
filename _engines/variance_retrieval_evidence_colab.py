@@ -1137,7 +1137,13 @@ def load_scurd_model(ckpt_path, in_dim=768, device="cuda"):
 
 def scurd_seed_suffix(seed):
     beta_tag = str(SCURD_BETA).replace(".", "")
-    return f"scurd_r{beta_tag}_e{SCURD_TRAIN_EPOCHS}_seed{int(seed)}"
+    suffix = f"scurd_r{beta_tag}_e{SCURD_TRAIN_EPOCHS}_seed{int(seed)}"
+    # Preserve the original default checkpoint names for lambda_cons=0.5, but
+    # avoid collisions for consistency-loss ablations such as lambda_cons=0.
+    if abs(float(SCURD_TRAIN_LAMBDA_CONS) - 0.5) > 1e-12:
+        cons_tag = str(SCURD_TRAIN_LAMBDA_CONS).replace(".", "")
+        suffix += f"_lc{cons_tag}"
+    return suffix
 
 
 def scurd_seed_ckpt_path(seed):
@@ -1293,11 +1299,18 @@ def train_one_scurd_seed(seed, device):
         "head_type": "residual",
         "epochs": int(SCURD_TRAIN_EPOCHS),
         "episodes_per_epoch": int(SCURD_TRAIN_EPISODES),
+        "n_way": int(SCURD_N_WAY),
+        "k_support": int(SCURD_K_SUPPORT),
+        "q_query": int(SCURD_Q_QUERY),
         "lambda_cons": float(SCURD_TRAIN_LAMBDA_CONS),
+        "lr": float(SCURD_TRAIN_LR),
+        "weight_decay": float(SCURD_WEIGHT_DECAY),
         "tau": float(SCURD_TAU),
         "seed": int(seed),
         "beta": float(SCURD_BETA),
         "learnable_beta": False,
+        "selection_metric": "lowest_training_loss",
+        "best_training_loss": float(best_loss),
         "cache_version": SCURD_CACHE_VERSION,
         "research_cache_version": RESEARCH_CACHE_VERSION,
         "meta_cache": str(SCURD_META_CACHE),
