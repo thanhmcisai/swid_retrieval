@@ -382,6 +382,7 @@ def main():
         _opt("RUN_APPENDIX_DISCUSSION", "1", lambda: __import__("swid_retrieval.experiments.appendix_discussion", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir, para_dir, dep_dir))
         if heavy:
             _opt("RUN_CE_FINETUNE", "1", lambda: __import__("swid_retrieval.experiments.ce_finetune", fromlist=["run"]).run(ctx_dep, nat_dir))
+            _opt("RUN_CLASS_INCREMENTAL", "1", lambda: __import__("swid_retrieval.experiments.class_incremental_baseline", fromlist=["run"]).run(ctx_dep, nat_dir))
             _opt("RUN_COSTS", "1", lambda: __import__("swid_retrieval.experiments.costs", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
         else:
             print("  RUN_HEAVY=0; skipping CE-finetune + costs (GPU/image).")

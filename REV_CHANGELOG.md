@@ -28,3 +28,14 @@
   domain novelty.
 - REV-5: add a held-out selection split if configuration-selection claims need
   to be separated from final reporting.
+- REV-8: `experiments/class_incremental_baseline.py` now emits
+  `native_experiments/class_incremental_baseline.json` for the frozen-old-row
+  CE class-incremental control. Run the Colab pipeline and add the resulting row
+  to the adaptation table if the baseline is retained.
+
+## REV-13 — CE forgetting framing
+
+- Manuscript wording was softened so the CE old=0 rows are described as a
+  naive no-rehearsal / trainable-head fine-tuning baseline, not as proof that
+  all classifier-based continual learning must fail.
+- No reported metric values were changed in this edit.
