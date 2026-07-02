@@ -100,6 +100,17 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
 ### Key env knobs
 - `RUN_BUILD_FULL954=0` — reuse an existing 954 cache (skip extraction).
 - `FORCE_REBUILD_FULL954=1` — rebuild even if a valid cache exists.
+- `RUN_HYPERPARAM_SELECTION=0` or `SKIP_HYPERPARAM_SELECTION=1` — skip the
+  SC-URD meta-val hyperparameter-selection audit.
+- `FORCE_HYPERPARAM_SELECTION=1` — recompute
+  `hyperparameters/scurd_hyperparameter_selection.{csv,json}` even if present.
+- `SKIP_BUILD_FULL954_CACHE=1`, `SKIP_DEPLOYMENT_PASS=1`,
+  `SKIP_PARADIGM_PASS=1`, `SKIP_REVIEW_PASS=1`, `SKIP_EDGE_PROXY=1`,
+  `SKIP_CE_TRAIN_PASS=1`, `SKIP_NATIVE_EXPERIMENTS=1`, `SKIP_SANITY=1`,
+  `SKIP_SUMMARY_MASTER=1`, `SKIP_VISUALIZE=1`, `SKIP_EXPORT=1` — resume a
+  partially completed run by reusing the corresponding output directories.
+- `RUN_DEPLOYMENT_PASS=0`, `RUN_PARADIGM_PASS=0`, `RUN_REVIEW_PASS=0`,
+  `RUN_NATIVE_EXPERIMENTS=0` — omit those steps in a new run.
 - `RUN_REVIEW_TAXONOMY_FULL_GALLERY=0`, `RUN_REVIEW_TAXONOMY_DEPLOYMENT=0`,
   `RUN_EDGE_PROXY=0` — skip those steps.
 - `RUN_HEAVY=0` — skip CE fine-tune and cost artifacts (`tab:deployment_cost`,
@@ -111,6 +122,11 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
 - `RUN_INTERPRETABILITY=0` — do not regenerate occlusion saliency images; the
   visualizer will still copy existing static saliency assets when available.
 - `RUN_CE_TRAIN_ROBUSTNESS=0` — skip the CE-train fairness pass (Step 5).
+- `SCURD_HPARAM_MODES`, `SCURD_HPARAM_TAUS`, `SCURD_HPARAM_TOP_MS`,
+  `SCURD_HPARAM_CKPT_GLOBS` — comma-separated grid for the meta-val-only
+  SC-URD hyperparameter audit. Defaults evaluate raw/centered scoring on the
+  available e10/e20/e40 and related SC-URD checkpoints without using public-ID,
+  OOD, or VN26 labels for selection.
 - `STRICT_SANITY=0` — downgrade the cardinality gate from hard-fail to warning.
 - `NUM_WORKERS`, `DEVICE` — Colab tuning.
 - `PRELOAD_IMAGE_CACHE=1` (default), `PRELOAD_ALL_IMAGES=1` (default in the

@@ -3,12 +3,13 @@
 
 Pipeline:
   0. Build the full-954 SWI gallery cache (+ aligned SC-URD swi_pool).
-  1. Run deployment experiments under the 24-species target gallery.
-  2. Run paradigm experiments under the matched 954-species SWI gallery.
-  3. Run review evidence under both scopes: full_swi for matched-954 statistics
+  1. Select/audit SC-URD hyperparameters on SWI meta-val.
+  2. Run deployment experiments under the 24-species target gallery.
+  3. Run paradigm experiments under the matched 954-species SWI gallery.
+  4. Run review evidence under both scopes: full_swi for matched-954 statistics
      and id_only for deployment failure taxonomy / optional saliency.
-  3. Run the edge/deployment timing proxy.
-  4. Cardinality sanity gate: full-gallery R@1 must be < the old 24-species R@1.
+  5. Run the edge/deployment timing proxy.
+  6. Cardinality sanity gate: full-gallery R@1 must be < the old 24-species R@1.
 
 Outputs go to a timestamped results/paper_reframe_full954_<stamp> dir so the
 original paper_reframe results and embedding_cache_v3.npz are never overwritten.
@@ -162,6 +163,32 @@ _SCURD_ARTIFACTS = ("sc_urd_checkpoint_scurd_r01_e20_v2.pt",
 _SCURD_SEED_GLOB = f"sc_urd_checkpoint_scurd_r01_e20_seed*_{config.SC_URD_CACHE_VERSION}.pt"
 
 
+def _env_true(name, default="0"):
+    return os.environ.get(name, default) == "1"
+
+
+def _skip(name):
+    return _env_true(f"SKIP_{name}", "0")
+
+
+def _run(name, default="1"):
+    return os.environ.get(f"RUN_{name}", default) == "1"
+
+
+def _copy_research_artifacts(src_research, dst_research):
+    """Copy reusable SC-URD research artifacts into a run-specific directory."""
+    dst_research.mkdir(parents=True, exist_ok=True)
+    for name in _SCURD_ARTIFACTS:
+        _copy_if_needed(src_research / name, dst_research / name)
+    for pattern in (
+        f"sc_urd_checkpoint_*_{config.SC_URD_CACHE_VERSION}.pt",
+        f"sc_urd_train_log_*_{config.SC_URD_CACHE_VERSION}.json",
+        _SCURD_SEED_GLOB,
+    ):
+        for path in Path(src_research).glob(pattern):
+            _copy_if_needed(path, dst_research / path.name)
+
+
 def _engine_pass(run_root, subdir, scope, enable, label, src_research):
     """Run the validated engine once at gallery `scope` into run_root/subdir, with
     only the RUN_* flags in `enable` turned on. Returns the pass directory."""
@@ -252,8 +279,7 @@ def main():
         "FULL954_RESULTS_DIR", config.ROOT_PATH / "results" / f"paper_reframe_full954_{stamp}"))
     (run_root / "research_directions").mkdir(parents=True, exist_ok=True)
     src_research = config.RESULTS_DIR / "research_directions"
-    for name in _SCURD_ARTIFACTS:                       # for the edge proxy
-        _copy_if_needed(src_research / name, run_root / "research_directions" / name)
+    _copy_research_artifacts(src_research, run_root / "research_directions")
 
     # Shared env (each pass overrides RESULTS_DIR/OUT_DIR/GALLERY_SCOPE/RUN_* itself).
     os.environ["ROOT_PATH"] = str(config.ROOT_PATH)
@@ -278,20 +304,31 @@ def main():
     _preload_images_if_requested()
 
     # Step 0 — build the full-954 gallery cache (the only heavy extraction).
-    if config.RUN_BUILD_FULL954:
-        print("\n[0/8] Building full-954 SWI gallery cache...")
+    if _skip("BUILD_FULL954_CACHE") or not config.RUN_BUILD_FULL954:
+        print("\n[0/9] SKIP_BUILD_FULL954_CACHE=1 or RUN_BUILD_FULL954=0; assuming full-954 cache already exists.")
+    else:
+        print("\n[0/9] Building full-954 SWI gallery cache...")
         from .embeddings import build_full954
         build_full954.main()
-    else:
-        print("\n[0/8] RUN_BUILD_FULL954=0; assuming full-954 cache already exists.")
 
-    # Step 1 — DEPLOYMENT (24-species target gallery): the experiments whose
+    # Step 1 — SC-URD hyperparameter selection/audit on SWI meta-val only.
+    if _skip("HYPERPARAM_SELECTION") or not _run("HYPERPARAM_SELECTION", "1"):
+        print("\n[1/9] SKIP_HYPERPARAM_SELECTION=1 or RUN_HYPERPARAM_SELECTION=0; skipping.")
+    else:
+        print("\n[1/9] SC-URD hyperparameter selection (SWI meta-val only)...")
+        try:
+            from .experiments import scurd_hyperparameters
+            manifest["scurd_hyperparameter_selection"] = scurd_hyperparameters.run(run_root)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  hyperparameter selection failed ({e}); continuing.")
+
+    # Step 2 — DEPLOYMENT (24-species target gallery): the experiments whose
     # research question is operational deployment. Trains SC-URD seeds once.
     dep_dir = run_root / "deployment"
-    if os.environ.get("SKIP_DEPLOYMENT_PASS", "0") == "1":
-        print(f"\n[1/8] SKIP_DEPLOYMENT_PASS=1; reusing {dep_dir}")
+    if _skip("DEPLOYMENT_PASS") or not _run("DEPLOYMENT_PASS", "1"):
+        print(f"\n[2/9] SKIP_DEPLOYMENT_PASS=1 or RUN_DEPLOYMENT_PASS=0; reusing {dep_dir}")
     else:
-        print("\n[1/8] Deployment experiments (id_only, 24 target species)...")
+        print("\n[2/9] Deployment experiments (id_only, 24 target species)...")
         dep_dir = _engine_pass(
             run_root, "deployment", "id_only",
             {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING",
@@ -303,48 +340,54 @@ def main():
         for p in (dep_dir / "research_directions").glob(_SCURD_SEED_GLOB):
             _copy_if_needed(p, src_research / p.name)
 
-    # Step 2 — PARADIGM (matched 954-species gallery): RQ1 + matched-954 deployment
+    # Step 3 — PARADIGM (matched 954-species gallery): RQ1 + matched-954 deployment
     # metrics for the appendix. Seeds already trained; not retrained here.
     para_dir = run_root / "paradigm"
-    if os.environ.get("SKIP_PARADIGM_PASS", "0") == "1":
-        print(f"\n[2/8] SKIP_PARADIGM_PASS=1; reusing {para_dir}")
+    if _skip("PARADIGM_PASS") or not _run("PARADIGM_PASS", "1"):
+        print(f"\n[3/9] SKIP_PARADIGM_PASS=1 or RUN_PARADIGM_PASS=0; reusing {para_dir}")
     else:
-        print("\n[2/8] Paradigm comparison (full_swi, matched 954 species)...")
+        print("\n[3/9] Paradigm comparison (full_swi, matched 954 species)...")
         para_dir = _engine_pass(
             run_root, "paradigm", "full_swi",
             {"RUN_HEADLINE_RECOMPUTE", "RUN_MAP", "RUN_GALLERY_RESAMPLING"},
             "variance (paradigm / full_swi)", src_research)
 
-    # Step 3 — review evidence. The matched-954 pass backs the statistical cleanup;
+    # Step 4 — review evidence. The matched-954 pass backs the statistical cleanup;
     # the deployment pass backs qualitative/failure-taxonomy discussion and optional
     # saliency figures. Keep both scopes explicit to avoid mixing 954- and 24-gallery
     # per-species results.
-    print("\n[3/8] Review evidence (matched-954 statistics + deployment taxonomy)...")
-    if config.RUN_REVIEW_TAXONOMY_FULL_GALLERY:
+    print("\n[4/9] Review evidence (matched-954 statistics + deployment taxonomy)...")
+    if _skip("REVIEW_PASS") or not _run("REVIEW_PASS", "1"):
+        print("  SKIP_REVIEW_PASS=1 or RUN_REVIEW_PASS=0; skipping both review evidence passes.")
+    elif config.RUN_REVIEW_TAXONOMY_FULL_GALLERY:
         _review_pass(para_dir, "full_swi", "review_evidence (paradigm / full_swi)",
                      run_interpretability=False)
         manifest["review_evidence_paradigm"] = str(para_dir / "review_evidence")
     else:
         print("  RUN_REVIEW_TAXONOMY_FULL_GALLERY=0; skipping full_swi review evidence.")
-    if config.RUN_REVIEW_TAXONOMY_DEPLOYMENT:
+    if _skip("REVIEW_PASS") or not _run("REVIEW_PASS", "1"):
+        pass
+    elif config.RUN_REVIEW_TAXONOMY_DEPLOYMENT:
         _review_pass(dep_dir, "id_only", "review_evidence (deployment / id_only)",
                      run_interpretability=os.environ.get("RUN_INTERPRETABILITY", "0") == "1")
         manifest["review_evidence_deployment"] = str(dep_dir / "review_evidence")
     else:
         print("  RUN_REVIEW_TAXONOMY_DEPLOYMENT=0; skipping deployment review evidence.")
 
-    # Step 4 — edge/deployment timing (scope-independent), once.
-    if config.RUN_EDGE_PROXY:
-        print("\n[4/8] Edge/deployment proxy timing...")
+    # Step 5 — edge/deployment timing (scope-independent), once.
+    if _skip("EDGE_PROXY") or not config.RUN_EDGE_PROXY:
+        print("\n[5/9] SKIP_EDGE_PROXY=1 or RUN_EDGE_PROXY=0; skipping edge proxy.")
+    else:
+        print("\n[5/9] Edge/deployment proxy timing...")
         os.environ["RESULTS_DIR"] = str(run_root)
         os.environ["OUT_DIR"] = str(run_root / "edge_deployment_proxy")
         _exec_script(EDGE_SCRIPT, "edge_deployment_proxy")
-    else:
-        print("\n[4/8] RUN_EDGE_PROXY=0; skipping edge proxy.")
 
-    # Step 5 — CE-train fairness robustness for RQ1.
-    if os.environ.get("RUN_CE_TRAIN_ROBUSTNESS", "1") == "1":
-        print("\n[5/8] CE-train robustness (gallery = CE-Full's exact train images)...")
+    # Step 6 — CE-train fairness robustness for RQ1.
+    if _skip("CE_TRAIN_PASS") or not _run("CE_TRAIN_ROBUSTNESS", "1"):
+        print("\n[6/9] SKIP_CE_TRAIN_PASS=1 or RUN_CE_TRAIN_ROBUSTNESS=0; skipping CE-train robustness.")
+    else:
+        print("\n[6/9] CE-train robustness (gallery = CE-Full's exact train images)...")
         # tab:ce_train_robustness only needs the headline (prototype/R@1); skip the
         # unused MAP / gallery-resampling passes to save compute.
         ce_dir = _engine_pass(
@@ -352,14 +395,12 @@ def main():
             {"RUN_HEADLINE_RECOMPUTE"},
             "variance (ce_train robustness)", src_research)
         manifest["ce_train_robustness"] = str(ce_dir)
-    else:
-        print("\n[5/8] RUN_CE_TRAIN_ROBUSTNESS=0; skipping CE-train robustness.")
 
-    # Step 6 — native (ported) experiments at the deployment gallery (24): the
+    # Step 7 — native (ported) experiments at the deployment gallery (24): the
     # paper experiments not covered by the engine passes (RQ4/VN26, extended OOD
     # baselines, OOD K-shot, RQ5-extra, appendix/discussion, CE-finetune, costs).
     # One registry build drives all; GPU/image-heavy ones honour RUN_HEAVY.
-    print("\n[6/8] Native experiments (RQ4 / OOD baselines / K-shot / ...)...")
+    print("\n[7/9] Native experiments (RQ4 / OOD baselines / K-shot / ...)...")
     os.environ["RESULTS_DIR"] = str(run_root)
     os.environ["GALLERY_SCOPE"] = "id_only"
     _point_config_at_results_dir(run_root)
@@ -369,49 +410,58 @@ def main():
     # depend on CE fine-tuning / cost artifacts. Set RUN_HEAVY=0 for a fast
     # logic/debug run that intentionally omits those tables.
     heavy = os.environ.get("RUN_HEAVY", "1") == "1"
-    try:
-        from .experiments import registry as _reg
-        M_dep, ctx_dep = _reg.build_M("id_only", with_exp4=True, with_scurd=True)
+    if _skip("NATIVE_EXPERIMENTS") or not _run("NATIVE_EXPERIMENTS", "1"):
+        print("  SKIP_NATIVE_EXPERIMENTS=1 or RUN_NATIVE_EXPERIMENTS=0; skipping native experiments.")
+    else:
+        try:
+            from .experiments import registry as _reg
+            M_dep, ctx_dep = _reg.build_M("id_only", with_exp4=True, with_scurd=True)
 
-        def _opt(flag, default, runner):
-            if os.environ.get(flag, default) != "1":
-                return
-            try:
-                runner()
-            except ImportError:
-                print(f"  {flag}: module not available yet; skipping.")
-            except Exception as e:  # noqa: BLE001
-                print(f"  {flag}: failed ({e}); continuing.")
+            def _opt(flag, default, runner):
+                if os.environ.get(flag, default) != "1":
+                    return
+                try:
+                    runner()
+                except ImportError:
+                    print(f"  {flag}: module not available yet; skipping.")
+                except Exception as e:  # noqa: BLE001
+                    print(f"  {flag}: failed ({e}); continuing.")
 
-        _opt("RUN_RQ4_VN26", "1", lambda: __import__("swid_retrieval.experiments.rq4_vn26", fromlist=["run"]).run(M_dep, nat_dir))
-        _opt("RUN_OOD_BASELINES", "1", lambda: __import__("swid_retrieval.experiments.ood_baselines", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
-        _opt("RUN_OOD_KSHOT", "1", lambda: __import__("swid_retrieval.experiments.kshot_openset", fromlist=["run"]).run(M_dep, nat_dir))
-        _opt("RUN_RQ5_EXTRA", "1", lambda: __import__("swid_retrieval.experiments.rq5_ablation_extra", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
-        _opt("RUN_APPENDIX_DISCUSSION", "1", lambda: __import__("swid_retrieval.experiments.appendix_discussion", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir, para_dir, dep_dir))
-        if heavy:
-            _opt("RUN_CE_FINETUNE", "1", lambda: __import__("swid_retrieval.experiments.ce_finetune", fromlist=["run"]).run(ctx_dep, nat_dir))
-            _opt("RUN_CLASS_INCREMENTAL", "1", lambda: __import__("swid_retrieval.experiments.class_incremental_baseline", fromlist=["run"]).run(ctx_dep, nat_dir))
-            _opt("RUN_COSTS", "1", lambda: __import__("swid_retrieval.experiments.costs", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
-        else:
-            print("  RUN_HEAVY=0; skipping CE-finetune + costs (GPU/image).")
-        # §K/§L completeness pass — fill any method × experiment cell still empty.
-        # Opt-in (default off) and idempotent: a normal run is unaffected.
-        _opt("RUN_FILL_MISSING", "0", lambda: __import__("swid_retrieval.experiments.fill_missing", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
-        # Backbone-agnostic centering generalization (cheap, cache-only).
-        _opt("RUN_CENTERING_ABLATION", "1", lambda: __import__("swid_retrieval.experiments.centering_ablation", fromlist=["run"]).run(nat_dir))
-        # SC-URD recipe on alternate bases (heavy: extracts base meta + trains adapters).
-        _opt("RUN_SCURD_BACKBONE", "1", lambda: __import__("swid_retrieval.experiments.scurd_backbone", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
-        manifest["native_experiments"] = str(nat_dir)
-    except Exception as e:  # noqa: BLE001
-        print(f"⚠️  native experiments failed ({e}); engine-pass results are still complete.")
+            _opt("RUN_RQ4_VN26", "1", lambda: __import__("swid_retrieval.experiments.rq4_vn26", fromlist=["run"]).run(M_dep, nat_dir))
+            _opt("RUN_OOD_BASELINES", "1", lambda: __import__("swid_retrieval.experiments.ood_baselines", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            _opt("RUN_OOD_KSHOT", "1", lambda: __import__("swid_retrieval.experiments.kshot_openset", fromlist=["run"]).run(M_dep, nat_dir))
+            _opt("RUN_RQ5_EXTRA", "1", lambda: __import__("swid_retrieval.experiments.rq5_ablation_extra", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            _opt("RUN_APPENDIX_DISCUSSION", "1", lambda: __import__("swid_retrieval.experiments.appendix_discussion", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir, para_dir, dep_dir))
+            if heavy:
+                _opt("RUN_CE_FINETUNE", "1", lambda: __import__("swid_retrieval.experiments.ce_finetune", fromlist=["run"]).run(ctx_dep, nat_dir))
+                _opt("RUN_CLASS_INCREMENTAL", "1", lambda: __import__("swid_retrieval.experiments.class_incremental_baseline", fromlist=["run"]).run(ctx_dep, nat_dir))
+                _opt("RUN_COSTS", "1", lambda: __import__("swid_retrieval.experiments.costs", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            else:
+                print("  RUN_HEAVY=0; skipping CE-finetune + costs (GPU/image).")
+            # §K/§L completeness pass — fill any method × experiment cell still empty.
+            # Opt-in (default off) and idempotent: a normal run is unaffected.
+            _opt("RUN_FILL_MISSING", "0", lambda: __import__("swid_retrieval.experiments.fill_missing", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            # Backbone-agnostic centering generalization (cheap, cache-only).
+            _opt("RUN_CENTERING_ABLATION", "1", lambda: __import__("swid_retrieval.experiments.centering_ablation", fromlist=["run"]).run(nat_dir))
+            # SC-URD recipe on alternate bases (heavy: extracts base meta + trains adapters).
+            _opt("RUN_SCURD_BACKBONE", "1", lambda: __import__("swid_retrieval.experiments.scurd_backbone", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            manifest["native_experiments"] = str(nat_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  native experiments failed ({e}); engine-pass results are still complete.")
 
-    # Step 7 — cardinality sanity: matched-954 R@1 must be < 24-species R@1.
-    print("\n[7/8] Cardinality sanity (matched-954 R@1 < 24-species deployment R@1)...")
+    # Step 8 — cardinality sanity: matched-954 R@1 must be < 24-species R@1.
+    print("\n[8/9] Cardinality sanity (matched-954 R@1 < 24-species deployment R@1)...")
     manifest["passes"] = {"deployment_24": str(dep_dir), "paradigm_954": str(para_dir)}
-    manifest["sanity"] = _cardinality_sanity(para_dir, dep_dir)
+    if _skip("SANITY"):
+        print("  SKIP_SANITY=1; skipping cardinality sanity.")
+        manifest["sanity"] = {"status": "skipped"}
+    else:
+        manifest["sanity"] = _cardinality_sanity(para_dir, dep_dir)
 
-    # Step 7b — §J cross-experiment master summary: pure join over emitted artifacts.
-    if os.environ.get("RUN_SUMMARY_MASTER", "1") == "1":
+    # Step 8b — §J cross-experiment master summary: pure join over emitted artifacts.
+    if _skip("SUMMARY_MASTER") or os.environ.get("RUN_SUMMARY_MASTER", "1") != "1":
+        print("  SKIP_SUMMARY_MASTER=1 or RUN_SUMMARY_MASTER=0; skipping master summary.")
+    else:
         try:
             from .experiments import summary_master
             summary_master.run(run_root)
@@ -419,20 +469,22 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  summary_master failed ({e}); results are still complete.")
 
-    # Step 8 — figures (vector PDFs) from the per-scope results.
-    if os.environ.get("RUN_VISUALIZE", "1") == "1":
-        print("\n[8/8] Rendering paper figures...")
+    # Step 9 — figures (vector PDFs) from the per-scope results.
+    if _skip("VISUALIZE") or os.environ.get("RUN_VISUALIZE", "1") != "1":
+        print("\n[9/9] SKIP_VISUALIZE=1 or RUN_VISUALIZE=0; skipping figures.")
+    else:
+        print("\n[9/9] Rendering paper figures...")
         try:
             from . import visualize
             visualize.main([None, str(run_root)])
             manifest["figures_dir"] = str(run_root / "figures")
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  visualize failed ({e}); results are still complete.")
-    else:
-        print("\n[8/8] RUN_VISUALIZE=0; skipping figures.")
 
     # Step 9 — consolidate all CSVs + figures into export/{csv,figures} (+ zips) for handoff.
-    if os.environ.get("RUN_EXPORT", "1") == "1":
+    if _skip("EXPORT") or os.environ.get("RUN_EXPORT", "1") != "1":
+        print("  SKIP_EXPORT=1 or RUN_EXPORT=0; skipping export.")
+    else:
         try:
             from . import export_results
             export_results.run(run_root)

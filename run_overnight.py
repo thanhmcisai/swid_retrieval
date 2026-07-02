@@ -42,12 +42,14 @@ _DEFAULTS = {
     "RUN_RQ5_FULL_GALLERY": "1",          # backbone/loss + SC-URD memory modes
     "RUN_SCURD_SEED_SENSITIVITY": "1",
     "RUN_TRAIN_SCURD_SEEDS": "1",         # train seeds 42/43/44 (skip if present)
+    "RUN_HYPERPARAM_SELECTION": "1",      # meta-val-only SC-URD selection audit
     "SCURD_TRAIN_SEEDS": "42,43,44",
     "SCURD_TRAIN_EPOCHS": "20",
     "SCURD_TRAIN_EPISODES": "500",
     "SCURD_TRAIN_LR": "1e-3",
     "SCURD_TRAIN_LAMBDA_CONS": "0.5",
     "SCURD_FORCE_RETRAIN_SEEDS": "0",
+    "FORCE_HYPERPARAM_SELECTION": "0",
     "N_GALLERY_REPEATS": "100",
     "N_BOOT": "2000",
     # Steps 2/3/5.

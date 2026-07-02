@@ -60,6 +60,7 @@ TABLE_SOURCES = {
     # RQ4 SC-URD design (open-set/few-shot reframe): backbone choice + centering generalization.
     "tab:scurd_backbone": "native_experiments/scurd_backbone_ablation.csv",
     "tab:centering_generalization": "native_experiments/centering_ablation.csv",
+    "tab:scurd_hyperparameters": "hyperparameters/scurd_hyperparameter_selection.csv",
 }
 FIG_STEMS = ["fig2a_rq1_paradigm", "fig2b_rq1_gallery_strategy", "fig3a_rq2_ood_detection",
              "fig3b_rq2_openset_retrieval", "fig5a_rq4_swi_to_vn26", "fig5b_rq4_cross_magnification",

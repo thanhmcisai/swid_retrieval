@@ -44,6 +44,8 @@ os.environ.setdefault("PRELOAD_TENSORS", "1")
 os.environ.setdefault("SCURD_MAIN_MODE", "centered")
 os.environ.setdefault("SCURD_TRAIN_LR", "1e-3")
 os.environ.setdefault("SCURD_TRAIN_LAMBDA_CONS", "0.5")
+os.environ.setdefault("RUN_HYPERPARAM_SELECTION", "1")
+os.environ.setdefault("FORCE_HYPERPARAM_SELECTION", "0")
 
 from . import orchestrator  # noqa: E402
 
