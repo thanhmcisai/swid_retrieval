@@ -2,9 +2,10 @@
 """Class-incremental CE baselines for the adaptation table.
 
 These are stronger controls than naive CE fine-tuning: old classifier rows are
-frozen, optional calibration uses old reference exemplars, and an iCaRL-style
-nearest-exemplar-mean baseline evaluates whether a continual classifier with
-exemplar memory converges toward the retrieval/prototype interface.
+frozen or rehearsed explicitly, calibration uses old reference exemplars, and an
+iCaRL-style nearest-exemplar-mean baseline evaluates whether a continual
+classifier with exemplar memory converges toward the retrieval/prototype
+interface.
 """
 
 import json
@@ -22,6 +23,7 @@ RQ3_CIL_EPOCHS = int(os.environ.get("RQ3_CIL_EPOCHS", "30"))
 RQ3_CIL_LR = float(os.environ.get("RQ3_CIL_LR", "1e-3"))
 RQ3_CIL_BATCH_SIZE = int(os.environ.get("RQ3_CIL_BATCH_SIZE", "32"))
 RQ3_CIL_OLD_CALIB_PER_SPECIES = int(os.environ.get("RQ3_CIL_OLD_CALIB_PER_SPECIES", "10"))
+RQ3_CIL_REHEARSAL_EPOCHS = int(os.environ.get("RQ3_CIL_REHEARSAL_EPOCHS", str(RQ3_CIL_EPOCHS)))
 
 
 def _extract_features(model, paths, device, batch_size=64):
@@ -161,6 +163,51 @@ def run(ctx, out_dir, K=10, seed=42):
     old_per_cal = _acc_by_species(old_blocks, x_old_query, gamma_new=best_gamma)
     new_per_cal = _acc_by_species(new_blocks, x_new_query, gamma_new=best_gamma)
 
+    # Rehearsal CE control: train a classifier head on frozen CE features using
+    # old public-ID exemplars plus new K-shot references. Only rehearsed old rows
+    # and new rows are allowed to move; the remaining 930 old rows stay fixed.
+    reh_w = nn.Parameter(torch.cat([old_w, new_w_cpu], dim=0).clone().to(dev))
+    reh_b = nn.Parameter(torch.cat([old_b, new_b_cpu], dim=0).clone().to(dev))
+    x_reh = torch.cat([x_old_calib, x_train.cpu()], dim=0)
+    y_reh = torch.tensor(old_calib_y + ft_y, dtype=torch.long)
+    reh_ds = TensorDataset(x_reh, y_reh)
+    reh_dl = DataLoader(reh_ds, batch_size=RQ3_CIL_BATCH_SIZE, shuffle=True)
+    movable_rows = torch.zeros(n_old + len(new_species), dtype=torch.bool, device=dev)
+    for sp in sorted(id_splits):
+        movable_rows[sp_to_old_idx[sp]] = True
+    movable_rows[n_old:] = True
+    reh_opt = torch.optim.AdamW([reh_w, reh_b], lr=RQ3_CIL_LR, weight_decay=1e-4)
+    for _ in range(RQ3_CIL_REHEARSAL_EPOCHS):
+        for xb, yb in reh_dl:
+            xb = xb.to(dev)
+            yb = yb.to(dev)
+            logits = xb @ reh_w.T + reh_b
+            loss = F.cross_entropy(logits, yb)
+            reh_opt.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                reh_w.grad[~movable_rows] = 0
+                reh_b.grad[~movable_rows] = 0
+            reh_opt.step()
+    reh_w_cpu = reh_w.detach().cpu()
+    reh_b_cpu = reh_b.detach().cpu()
+
+    def _predict_rehearsal(feats):
+        pred = (feats @ reh_w_cpu.T + reh_b_cpu).argmax(1).numpy()
+        return np.asarray([all_species[int(i)] for i in pred])
+
+    pred_old_reh = _predict_rehearsal(x_old_query)
+    pred_new_reh = _predict_rehearsal(x_new_query)
+    old_reh_per, new_reh_per = {}, {}
+    off = 0
+    for sp, n in old_blocks:
+        old_reh_per[sp] = float((pred_old_reh[off:off + n] == sp).mean()) if n else 0.0
+        off += n
+    off = 0
+    for sp, n in new_blocks:
+        new_reh_per[sp] = float((pred_new_reh[off:off + n] == sp).mean()) if n else 0.0
+        off += n
+
     def _proto_predict(q_feats, proto_mat, proto_labels):
         q = q_feats.numpy()
         q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
@@ -221,6 +268,22 @@ def run(ctx, out_dir, K=10, seed=42):
             "note": "New-row logits are bias-calibrated on old reference-pool images and new K-shot references only.",
         },
         {
+            "strategy": "ce_rehearsal_frozen_features",
+            "acc_old_id_species": float(np.mean(list(old_reh_per.values()))),
+            "acc_new_species": float(np.mean(list(new_reh_per.values()))),
+            "method_family": "cross-entropy rehearsal",
+            "updates_backbone": False,
+            "updates_old_class_rows": True,
+            "updates_only_rehearsed_old_rows": True,
+            "uses_rehearsal": True,
+            "old_calib_images_per_species": int(RQ3_CIL_OLD_CALIB_PER_SPECIES),
+            "new_exemplars_per_species": int(K),
+            "n_epochs": int(RQ3_CIL_REHEARSAL_EPOCHS),
+            "lr": float(RQ3_CIL_LR),
+            "calibration_gamma_new": None,
+            "note": "CE rehearsal on frozen CE features using old public-ID exemplars plus new K-shot references; non-rehearsed old rows remain frozen.",
+        },
+        {
             "strategy": "icarl_nearest_exemplar_mean",
             "acc_old_id_species": float(np.mean(list(old_proto_per.values()))),
             "acc_new_species": float(np.mean(list(new_proto_per.values()))),
@@ -252,6 +315,8 @@ def run(ctx, out_dir, K=10, seed=42):
         "variants": variants,
         "calibrated_old_per_species": old_per_cal,
         "calibrated_new_per_species": new_per_cal,
+        "rehearsal_old_per_species": old_reh_per,
+        "rehearsal_new_per_species": new_reh_per,
         "icarl_old_per_species": old_proto_per,
         "icarl_new_per_species": new_proto_per,
         "note": "Top-level metrics preserve the original new-rows-only baseline. See variants for bias-calibrated and iCaRL-style exemplar-mean controls.",
