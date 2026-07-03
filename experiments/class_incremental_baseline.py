@@ -22,6 +22,7 @@ from . import registry as R
 RQ3_CIL_EPOCHS = int(os.environ.get("RQ3_CIL_EPOCHS", "30"))
 RQ3_CIL_LR = float(os.environ.get("RQ3_CIL_LR", "1e-3"))
 RQ3_CIL_BATCH_SIZE = int(os.environ.get("RQ3_CIL_BATCH_SIZE", "32"))
+RQ3_CIL_OLD_CALIB_PER_SPECIES = int(os.environ.get("RQ3_CIL_OLD_CALIB_PER_SPECIES", "10"))
 
 
 def _extract_features(model, paths, device, batch_size=64):
@@ -97,18 +98,141 @@ def run(ctx, out_dir, K=10, seed=42):
     new_w_cpu = new_w.detach().cpu()
     new_b_cpu = new_b.detach().cpu()
 
-    def _predict(paths):
-        feats = _extract_features(model_ce, paths, dev).cpu()
-        logits_old = feats @ old_w.T + old_b
-        logits_new = feats @ new_w_cpu.T + new_b_cpu
-        pred = torch.cat([logits_old, logits_new], dim=1).argmax(1).numpy()
-        return np.asarray([all_species[int(i)] for i in pred])
+    sp_to_old_idx = {sp: i for i, sp in enumerate(ce_species)}
+    new_to_idx = {sp: n_old + i for i, sp in enumerate(new_species)}
 
-    old_per = {sp: float((_predict(id_splits[sp]["query"]) == sp).mean()) for sp in id_splits}
-    new_per = {}
+    old_query_paths, old_query_y = [], []
+    old_calib_paths, old_calib_y = [], []
+    for sp in sorted(id_splits):
+        old_query_paths.extend(id_splits[sp]["query"])
+        old_query_y.extend([sp_to_old_idx[sp]] * len(id_splits[sp]["query"]))
+        old_pool = id_splits[sp]["pool"][:RQ3_CIL_OLD_CALIB_PER_SPECIES]
+        old_calib_paths.extend(old_pool)
+        old_calib_y.extend([sp_to_old_idx[sp]] * len(old_pool))
+
+    new_query_paths, new_query_y = [], []
     for sp in new_species:
         q_paths = [str(ood_df.iloc[i]["file_path"]) for i in splits[sp]["query_indices"]]
-        new_per[sp] = float((_predict(q_paths) == sp).mean())
+        new_query_paths.extend(q_paths)
+        new_query_y.extend([new_to_idx[sp]] * len(q_paths))
+
+    x_old_query = _extract_features(model_ce, old_query_paths, dev).cpu()
+    x_old_calib = _extract_features(model_ce, old_calib_paths, dev).cpu()
+    x_new_query = _extract_features(model_ce, new_query_paths, dev).cpu()
+
+    def _logits_from_feats(feats, gamma_new=0.0):
+        logits_old = feats @ old_w.T + old_b
+        logits_new = feats @ new_w_cpu.T + new_b_cpu - float(gamma_new)
+        return torch.cat([logits_old, logits_new], dim=1)
+
+    def _predict_feats(feats, gamma_new=0.0):
+        pred = _logits_from_feats(feats, gamma_new=gamma_new).argmax(1).numpy()
+        return np.asarray([all_species[int(i)] for i in pred])
+
+    def _acc_by_species(paths_by_species, feats, gamma_new=0.0):
+        pred = _predict_feats(feats, gamma_new=gamma_new)
+        out, off = {}, 0
+        for sp, n in paths_by_species:
+            out[sp] = float((pred[off:off + n] == sp).mean()) if n else 0.0
+            off += n
+        return out
+
+    old_blocks = [(sp, len(id_splits[sp]["query"])) for sp in sorted(id_splits)]
+    new_blocks = [(sp, len(splits[sp]["query_indices"])) for sp in new_species]
+
+    old_per = _acc_by_species(old_blocks, x_old_query, gamma_new=0.0)
+    new_per = _acc_by_species(new_blocks, x_new_query, gamma_new=0.0)
+
+    # Bias calibration uses only reference/calibration images: old public-ID pool
+    # and the K-shot new-species references. It does not inspect the query sets.
+    x_cal = torch.cat([x_old_calib, x_train.cpu()], dim=0)
+    y_cal = np.asarray(old_calib_y + ft_y, dtype=int)
+    gamma_grid = np.linspace(-30.0, 30.0, 241)
+    best_gamma, best_score, best_old_cal, best_new_cal = 0.0, -1.0, 0.0, 0.0
+    for gamma in gamma_grid:
+        pred = _logits_from_feats(x_cal, gamma_new=float(gamma)).argmax(1).numpy()
+        old_mask = y_cal < n_old
+        new_mask = ~old_mask
+        old_acc = float((pred[old_mask] == y_cal[old_mask]).mean()) if old_mask.any() else 0.0
+        new_acc = float((pred[new_mask] == y_cal[new_mask]).mean()) if new_mask.any() else 0.0
+        score = float(np.sqrt(max(old_acc, 0.0) * max(new_acc, 0.0)))
+        if score > best_score:
+            best_score, best_gamma, best_old_cal, best_new_cal = score, float(gamma), old_acc, new_acc
+
+    old_per_cal = _acc_by_species(old_blocks, x_old_query, gamma_new=best_gamma)
+    new_per_cal = _acc_by_species(new_blocks, x_new_query, gamma_new=best_gamma)
+
+    def _proto_predict(q_feats, proto_mat, proto_labels):
+        q = q_feats.numpy()
+        q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+        sims = q @ proto_mat.T
+        return np.asarray(proto_labels)[sims.argmax(axis=1)]
+
+    proto_vecs, proto_labels = [], []
+    old_calib_y = np.asarray(old_calib_y)
+    old_cal_np = x_old_calib.numpy()
+    for sp in sorted(id_splits):
+        idx = np.where(old_calib_y == sp_to_old_idx[sp])[0]
+        if len(idx):
+            proto_vecs.append(old_cal_np[idx].mean(axis=0))
+            proto_labels.append(sp)
+    x_train_np = x_train.numpy()
+    ft_y_np = np.asarray(ft_y)
+    for sp in new_species:
+        idx = np.where(ft_y_np == new_to_idx[sp])[0]
+        if len(idx):
+            proto_vecs.append(x_train_np[idx].mean(axis=0))
+            proto_labels.append(sp)
+    proto_mat = np.asarray(proto_vecs, dtype=np.float32)
+    proto_mat = proto_mat / np.maximum(np.linalg.norm(proto_mat, axis=1, keepdims=True), 1e-12)
+    pred_old_proto = _proto_predict(x_old_query, proto_mat, proto_labels)
+    pred_new_proto = _proto_predict(x_new_query, proto_mat, proto_labels)
+    old_proto_per, new_proto_per = {}, {}
+    off = 0
+    for sp, n in old_blocks:
+        old_proto_per[sp] = float((pred_old_proto[off:off + n] == sp).mean()) if n else 0.0
+        off += n
+    off = 0
+    for sp, n in new_blocks:
+        new_proto_per[sp] = float((pred_new_proto[off:off + n] == sp).mean()) if n else 0.0
+        off += n
+
+    variants = [
+        {
+            "strategy": "frozen_old_rows_new_rows_only",
+            "acc_old_id_species": float(np.mean(list(old_per.values()))),
+            "acc_new_species": float(np.mean(list(new_per.values()))),
+            "updates_backbone": False,
+            "updates_old_class_rows": False,
+            "uses_rehearsal": False,
+            "calibration_gamma_new": 0.0,
+            "note": "Only new classifier rows are trained from K-shot OOD references; no old calibration/rehearsal is used.",
+        },
+        {
+            "strategy": "frozen_old_rows_new_rows_bias_calibrated",
+            "acc_old_id_species": float(np.mean(list(old_per_cal.values()))),
+            "acc_new_species": float(np.mean(list(new_per_cal.values()))),
+            "updates_backbone": False,
+            "updates_old_class_rows": False,
+            "uses_rehearsal": True,
+            "old_calib_images_per_species": int(RQ3_CIL_OLD_CALIB_PER_SPECIES),
+            "calibration_gamma_new": float(best_gamma),
+            "calibration_old_acc": float(best_old_cal),
+            "calibration_new_acc": float(best_new_cal),
+            "note": "New-row logits are bias-calibrated on old reference-pool images and new K-shot references only.",
+        },
+        {
+            "strategy": "frozen_ce_feature_nearest_prototype",
+            "acc_old_id_species": float(np.mean(list(old_proto_per.values()))),
+            "acc_new_species": float(np.mean(list(new_proto_per.values()))),
+            "updates_backbone": False,
+            "updates_old_class_rows": False,
+            "uses_rehearsal": True,
+            "old_calib_images_per_species": int(RQ3_CIL_OLD_CALIB_PER_SPECIES),
+            "calibration_gamma_new": None,
+            "note": "Frozen CE features classified by nearest old/new reference prototypes; this is a classifier-feature CIL control that approaches retrieval.",
+        },
+    ]
 
     out = {
         "strategy": "frozen_old_rows_new_rows_only",
@@ -124,11 +248,19 @@ def run(ctx, out_dir, K=10, seed=42):
         "acc_new_species": float(np.mean(list(new_per.values()))),
         "old_per_species": old_per,
         "new_per_species": new_per,
-        "note": "Frozen CE-Full backbone/head and frozen old classifier rows; only new rows are trained from K-shot OOD references.",
+        "variants": variants,
+        "calibrated_old_per_species": old_per_cal,
+        "calibrated_new_per_species": new_per_cal,
+        "prototype_old_per_species": old_proto_per,
+        "prototype_new_per_species": new_proto_per,
+        "note": "Top-level metrics preserve the original new-rows-only baseline. See variants for bias-calibrated and prototype controls.",
     }
     os.makedirs(str(out_dir), exist_ok=True)
     path = os.path.join(str(out_dir), "class_incremental_baseline.json")
     with open(path, "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
+    csv_path = os.path.join(str(out_dir), "class_incremental_baseline.csv")
+    pd.DataFrame(variants).to_csv(csv_path, index=False)
     print(f"saved {path}: old={out['acc_old_id_species']:.3f} new={out['acc_new_species']:.3f}")
+    print(f"saved {csv_path}")
     return out
