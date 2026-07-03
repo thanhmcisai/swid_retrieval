@@ -441,9 +441,11 @@ def main():
 
             _opt("RUN_RQ4_VN26", "1", lambda: __import__("swid_retrieval.experiments.rq4_vn26", fromlist=["run"]).run(M_dep, nat_dir))
             _opt("RUN_OOD_BASELINES", "1", lambda: __import__("swid_retrieval.experiments.ood_baselines", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            _opt("RUN_OOD_WITHIN_SOURCE", "1", lambda: __import__("swid_retrieval.experiments.ood_within_source", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
             _opt("RUN_OOD_KSHOT", "1", lambda: __import__("swid_retrieval.experiments.kshot_openset", fromlist=["run"]).run(M_dep, nat_dir))
             _opt("RUN_RQ5_EXTRA", "1", lambda: __import__("swid_retrieval.experiments.rq5_ablation_extra", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
             _opt("RUN_SCURD_SELECTED_HPARAM_EVAL", "1", lambda: __import__("swid_retrieval.experiments.scurd_selected_hparam_eval", fromlist=["run"]).run(run_root))
+            _opt("RUN_SCURD_TRAINING_ABLATION", "1", lambda: __import__("swid_retrieval.experiments.scurd_training_ablation", fromlist=["run"]).run(run_root, nat_dir))
             _opt("RUN_APPENDIX_DISCUSSION", "1", lambda: __import__("swid_retrieval.experiments.appendix_discussion", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir, para_dir, dep_dir))
             if heavy:
                 _opt("RUN_CE_FINETUNE", "1", lambda: __import__("swid_retrieval.experiments.ce_finetune", fromlist=["run"]).run(ctx_dep, nat_dir))

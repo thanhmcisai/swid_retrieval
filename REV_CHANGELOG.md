@@ -20,12 +20,20 @@
 
 ## Open follow-up tasks requiring new Colab runs
 
-- REV-2: run consistency-loss ablation (`lambda_cons in {0, 0.5}`) and report
-  mean/std across seeds.
+- REV-2: `experiments/scurd_training_ablation.py` now runs the consistency-loss
+  ablation (`lambda_cons in {0, 0.5}` by default) through the validated
+  variance engine and writes `native_experiments/scurd_consistency_ablation.csv`
+  plus `native_experiments/scurd_training_ablation.json`. Pending Colab run and
+  manuscript table/prose update.
+- REV-1: the same module writes `native_experiments/scurd_lr_ablation.csv` for
+  the empirical `lr in {1e-3,1e-4}` audit. Non-default LR seed checkpoints now
+  receive an `_lr...` suffix so the audit cannot reuse the default `1e-3`
+  checkpoints accidentally.
 - REV-3: surface SC-URD seed mean/std in the main tables and retrain SupCon
   across seeds if the OOD AUROC comparison remains central.
-- REV-4: add same-source OOD protocol to separate species novelty from source
-  domain novelty.
+- REV-4: `experiments/ood_within_source.py` now adds a source-controlled OOD
+  protocol and writes `native_experiments/ood_within_source.csv/json`. Pending
+  Colab run and manuscript table/prose update.
 - REV-5: add a held-out selection split if configuration-selection claims need
   to be separated from final reporting.
 - REV-8: `experiments/class_incremental_baseline.py` now emits

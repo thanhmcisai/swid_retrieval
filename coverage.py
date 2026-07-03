@@ -51,6 +51,7 @@ TABLE_SOURCES = {
                            "native_experiments/rq4_generalization.json"],
     "tab:appendix_fpr95_ci": "deployment/variance_evidence/fpr95_difference_bootstrap_ci_full_gallery.csv",
     "tab:appendix_ood_extended": "native_experiments/rq2_ood_extended.json",
+    "tab:ood_within_source": "native_experiments/ood_within_source.csv",
     "tab:ood_by_source": "deployment/variance_evidence/ood_by_source_scurd_full_gallery.csv",
     "tab:appendix_ood_kshot": "native_experiments/rq2_kshot.json",
     # Failure taxonomy is discussed as deployment behaviour; use the 24-species
@@ -61,6 +62,8 @@ TABLE_SOURCES = {
     "tab:scurd_backbone": "native_experiments/scurd_backbone_ablation.csv",
     "tab:centering_generalization": "native_experiments/centering_ablation.csv",
     "tab:scurd_hyperparameters": "hyperparameters/scurd_hyperparameter_selection.csv",
+    "tab:scurd_consistency_ablation": "native_experiments/scurd_consistency_ablation.csv",
+    "tab:scurd_lr_ablation": "native_experiments/scurd_lr_ablation.csv",
 }
 FIG_STEMS = ["fig2a_rq1_paradigm", "fig2b_rq1_gallery_strategy", "fig3a_rq2_ood_detection",
              "fig3b_rq2_openset_retrieval", "fig5a_rq4_swi_to_vn26", "fig5b_rq4_cross_magnification",

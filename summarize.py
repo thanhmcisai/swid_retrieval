@@ -109,10 +109,13 @@ def main(argv):
     nat = rd / "native_experiments"
     _json_block(nat / "rq4_generalization.json", "RQ4/VN26 e4a_wilcoxon (tab:vn26_wilcoxon)", "e4a_wilcoxon")
     _ood_baselines(nat / "rq2_ood_extended.json", "OOD baselines (tab:appendix_ood_extended)")
+    _csv(nat / "ood_within_source.csv", "same-source OOD protocol (REV-4)", max_rows=80)
     _kshot(nat / "rq2_kshot.json", "OOD K-shot (tab:appendix_ood_kshot)")
     _json_block(nat / "rq5_inference_calibration.json", "RQ5 inference calibration", "inference_calibration")
     _csv(nat / "centering_ablation.csv", "centering generalization across backbones (tab:centering_generalization)", max_rows=60)
     _csv(nat / "scurd_backbone_ablation.csv", "SC-URD backbone ablation (tab:scurd_backbone)")
+    _csv(nat / "scurd_consistency_ablation.csv", "SC-URD consistency-loss ablation (REV-2)", max_rows=80)
+    _csv(nat / "scurd_lr_ablation.csv", "SC-URD learning-rate audit (REV-1)", max_rows=80)
     _json_block(nat / "appendix_evidence.json", "Appendix pairwise RQ1", "pairwise_rq1")
     _json_block(nat / "exp3_ce_finetune.json", "CE fine-tune forgetting (tab:adapt CE rows)", None)
     _json_block(nat / "deployment_search_cost.json", "Search-cost scaling (tab:inference_cost)", "search_scaling")

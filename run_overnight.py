@@ -63,6 +63,8 @@ _DEFAULTS = {
     "RUN_HEAVY": "1",                     # paper cost tables require CE-finetune + costs
     "RUN_CLASS_INCREMENTAL": "1",         # stronger CE adaptation control
     "RUN_SCURD_SELECTED_HPARAM_EVAL": "1",# evaluate meta-val selected SC-URD scorer
+    "RUN_SCURD_TRAINING_ABLATION": "1",   # REV-1/2: lr + consistency ablations
+    "RUN_OOD_WITHIN_SOURCE": "1",         # REV-4: source-controlled OOD protocol
     "RUN_SCURD_BACKBONE": "1",            # paper tab:scurd_backbone
     # Overnight operation.
     "STRICT_SANITY": "0",                 # warn (don't crash) if the gate trips

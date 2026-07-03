@@ -1143,6 +1143,9 @@ def scurd_seed_suffix(seed):
     if abs(float(SCURD_TRAIN_LAMBDA_CONS) - 0.5) > 1e-12:
         cons_tag = str(SCURD_TRAIN_LAMBDA_CONS).replace(".", "")
         suffix += f"_lc{cons_tag}"
+    if abs(float(SCURD_TRAIN_LR) - 1e-3) > 1e-15:
+        lr_tag = str(SCURD_TRAIN_LR).replace(".", "").replace("-", "m")
+        suffix += f"_lr{lr_tag}"
     return suffix
 
 
