@@ -30,6 +30,7 @@ _DEFAULTS = {
     "FORCE_REBUILD_FULL954": "0",   # 0 -> skip if a valid 954 cache already exists
     "SAVE_PARTIAL": "1",            # resumable extraction
     "PRELOAD_IMAGE_CACHE": "1",
+    "PRELOAD_IMAGE_SCOPE": "all",     # all | public | swi | none
     "PRELOAD_ALL_IMAGES": "1",      # SWI + public ID/OOD image CSVs
     "IMAGE_CACHE_DIR": "/content/cache_images",
     "PRELOAD_WORKERS": "16",

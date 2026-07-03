@@ -85,22 +85,35 @@ def build(device=None, force=None):
     swi_ds = ManifestDataset(items, transform=get_transforms(224, augment=False))
 
     # Pre-warm the local image cache in parallel (Drive is slow per-file). When
-    # PRELOAD_ALL_IMAGES=1, include public ID/OOD image CSVs as well as SWI; this
-    # helps later saliency/timing/cost steps avoid lazy Drive reads. If the
-    # orchestrator already did the global prewarm, skip this local prewarm.
+    # PRELOAD_IMAGE_SCOPE=all/public or legacy PRELOAD_ALL_IMAGES=1, include
+    # public ID/OOD image CSVs as well as SWI; this helps later saliency/timing/
+    # cost steps avoid lazy Drive reads. If the orchestrator already did the
+    # global prewarm, skip this local prewarm.
     if (
         os.environ.get("PRELOAD_IMAGE_CACHE", "1") == "1"
         and os.environ.get("SWID_IMAGE_PRELOAD_DONE", "0") != "1"
     ):
-        if os.environ.get("PRELOAD_ALL_IMAGES", "0") == "1":
+        scope = os.environ.get("PRELOAD_IMAGE_SCOPE", "").strip().lower()
+        if not scope:
+            scope = "all" if os.environ.get("PRELOAD_ALL_IMAGES", "0") == "1" else "swi"
+        if scope == "all":
             preload_paths = collect_all_image_paths(config.ROOT_PATH, include_swi=True, include_public=True)
             preload_desc = "Preloading SWI + public ID/OOD images"
-        else:
+        elif scope == "public":
+            preload_paths = collect_all_image_paths(config.ROOT_PATH, include_swi=False, include_public=True)
+            preload_desc = "Preloading public ID/OOD images"
+        elif scope == "swi":
             preload_paths = [s[0] for s in swi_ds.samples]
             preload_desc = "Preloading SWI gallery images"
-        preload_image_cache(preload_paths,
-                            max_workers=int(os.environ.get("PRELOAD_WORKERS", "16")),
-                            desc=preload_desc)
+        elif scope in {"0", "false", "off", "none", "no"}:
+            preload_paths = []
+            preload_desc = None
+        else:
+            raise ValueError(f"Unknown PRELOAD_IMAGE_SCOPE={scope!r}; use all, public, swi, or none.")
+        if preload_paths:
+            preload_image_cache(preload_paths,
+                                max_workers=int(os.environ.get("PRELOAD_WORKERS", "16")),
+                                desc=preload_desc)
 
     swi_loader = DataLoader(swi_ds, batch_size=64, num_workers=config.num_workers(),
                             pin_memory=True, persistent_workers=True, prefetch_factor=4)

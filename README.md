@@ -140,15 +140,14 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
   OOD, or VN26 labels for selection.
 - `STRICT_SANITY=0` — downgrade the cardinality gate from hard-fail to warning.
 - `NUM_WORKERS`, `DEVICE` — Colab tuning.
-- `PRELOAD_IMAGE_CACHE=1` (default), `PRELOAD_ALL_IMAGES=1` (default in the
-  Colab/overnight runners), `PRELOAD_WORKERS=16`, `IMAGE_CACHE_DIR=/content/cache_images`
-  — pre-warm Drive images into the local JPEG cache before experiments start.
-  With `PRELOAD_ALL_IMAGES=1`, the preloader collects all SWI paths from
-  `swi_manifest.json` plus public query/reference paths from
-  `ID_images_expanded.csv` and `OOD_images_expanded.csv`, normalising any old
-  local-machine prefixes to the active Drive dataset root. Set
-  `PRELOAD_ALL_IMAGES=0` to pre-warm only SWI during `build_full954`, or
-  `PRELOAD_IMAGE_CACHE=0` to disable image pre-warming entirely.
+- `PRELOAD_IMAGE_CACHE=1` (default), `PRELOAD_IMAGE_SCOPE=all`,
+  `PRELOAD_WORKERS=16`, `IMAGE_CACHE_DIR=/content/cache_images` — pre-warm Drive
+  images into the local JPEG cache before experiments start. Scope values are:
+  `all` (SWI + public ID/OOD), `public` (`ID_images_expanded.csv` and
+  `OOD_images_expanded.csv` only), `swi` (SWI manifest only), or `none`.
+  `PRELOAD_ALL_IMAGES=1` remains as a backward-compatible alias for
+  `PRELOAD_IMAGE_SCOPE=all`. For class-incremental-only reruns after a Colab
+  restart, use `PRELOAD_IMAGE_SCOPE=public` to avoid caching the full SWI pool.
 
 ### Gallery scopes (`GALLERY_SCOPE`)
 - `full_swi` (default) — all 954 SWI species; the cardinality-matched protocol.

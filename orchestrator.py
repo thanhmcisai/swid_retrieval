@@ -251,14 +251,26 @@ def _preload_images_if_requested():
         return
     if os.environ.get("SWID_IMAGE_PRELOAD_DONE", "0") == "1":
         return
-    if os.environ.get("PRELOAD_ALL_IMAGES", "0") != "1":
+    scope = os.environ.get("PRELOAD_IMAGE_SCOPE", "").strip().lower()
+    if not scope:
+        scope = "all" if os.environ.get("PRELOAD_ALL_IMAGES", "0") == "1" else "none"
+    if scope in {"0", "false", "off", "none", "no"}:
         return
+    if scope not in {"all", "public", "swi"}:
+        raise ValueError(f"Unknown PRELOAD_IMAGE_SCOPE={scope!r}; use all, public, swi, or none.")
     from .data import collect_all_image_paths, preload_image_cache
-    paths = collect_all_image_paths(config.ROOT_PATH, include_swi=True, include_public=True)
+    include_swi = scope in {"all", "swi"}
+    include_public = scope in {"all", "public"}
+    paths = collect_all_image_paths(config.ROOT_PATH, include_swi=include_swi, include_public=include_public)
+    desc_map = {
+        "all": "Preloading SWI + public ID/OOD images",
+        "public": "Preloading public ID/OOD images",
+        "swi": "Preloading SWI images",
+    }
     preload_image_cache(
         paths,
         max_workers=int(os.environ.get("PRELOAD_WORKERS", "16")),
-        desc="Preloading SWI + public ID/OOD images",
+        desc=desc_map[scope],
     )
     os.environ["SWID_IMAGE_PRELOAD_DONE"] = "1"
 
