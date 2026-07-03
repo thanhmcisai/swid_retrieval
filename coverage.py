@@ -64,6 +64,7 @@ TABLE_SOURCES = {
     "tab:scurd_hyperparameters": "hyperparameters/scurd_hyperparameter_selection.csv",
     "tab:scurd_consistency_ablation": "native_experiments/scurd_consistency_ablation.csv",
     "tab:scurd_lr_ablation": "native_experiments/scurd_lr_ablation.csv",
+    "tab:supcon_seed_sensitivity": "native_experiments/supcon_seed_sensitivity_summary.csv",
 }
 FIG_STEMS = ["fig2a_rq1_paradigm", "fig2b_rq1_gallery_strategy", "fig3a_rq2_ood_detection",
              "fig3b_rq2_openset_retrieval", "fig5a_rq4_swi_to_vn26", "fig5b_rq4_cross_magnification",

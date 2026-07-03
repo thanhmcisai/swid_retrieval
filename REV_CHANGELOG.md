@@ -29,8 +29,12 @@
   the empirical `lr in {1e-3,1e-4}` audit. Non-default LR seed checkpoints now
   receive an `_lr...` suffix so the audit cannot reuse the default `1e-3`
   checkpoints accidentally.
-- REV-3: surface SC-URD seed mean/std in the main tables and retrain SupCon
-  across seeds if the OOD AUROC comparison remains central.
+- REV-3: `experiments/supcon_seed_sensitivity.py` now provides an opt-in
+  SupCon multi-seed OOD audit (`RUN_SUPCON_SEED_SENSITIVITY=1`). It trains
+  seed-specific ConvNeXt SupCon checkpoints when absent, extracts ID/OOD/SWI
+  embeddings from images, and writes `native_experiments/supcon_seed_sensitivity.csv`
+  plus `native_experiments/supcon_seed_sensitivity_summary.csv`. It is off by
+  default because it is image/GPU-heavy.
 - REV-4: `experiments/ood_within_source.py` now adds a source-controlled OOD
   protocol and writes `native_experiments/ood_within_source.csv/json`. Pending
   Colab run and manuscript table/prose update.

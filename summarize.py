@@ -116,6 +116,7 @@ def main(argv):
     _csv(nat / "scurd_backbone_ablation.csv", "SC-URD backbone ablation (tab:scurd_backbone)")
     _csv(nat / "scurd_consistency_ablation.csv", "SC-URD consistency-loss ablation (REV-2)", max_rows=80)
     _csv(nat / "scurd_lr_ablation.csv", "SC-URD learning-rate audit (REV-1)", max_rows=80)
+    _csv(nat / "supcon_seed_sensitivity_summary.csv", "SupCon OOD seed sensitivity (REV-3)")
     _json_block(nat / "appendix_evidence.json", "Appendix pairwise RQ1", "pairwise_rq1")
     _json_block(nat / "exp3_ce_finetune.json", "CE fine-tune forgetting (tab:adapt CE rows)", None)
     _json_block(nat / "deployment_search_cost.json", "Search-cost scaling (tab:inference_cost)", "search_scaling")

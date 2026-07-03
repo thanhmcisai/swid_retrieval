@@ -451,8 +451,9 @@ def main():
                 _opt("RUN_CE_FINETUNE", "1", lambda: __import__("swid_retrieval.experiments.ce_finetune", fromlist=["run"]).run(ctx_dep, nat_dir))
                 _opt("RUN_CLASS_INCREMENTAL", "1", lambda: __import__("swid_retrieval.experiments.class_incremental_baseline", fromlist=["run"]).run(ctx_dep, nat_dir))
                 _opt("RUN_COSTS", "1", lambda: __import__("swid_retrieval.experiments.costs", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+                _opt("RUN_SUPCON_SEED_SENSITIVITY", "0", lambda: __import__("swid_retrieval.experiments.supcon_seed_sensitivity", fromlist=["run"]).run(run_root, nat_dir))
             else:
-                print("  RUN_HEAVY=0; skipping CE-finetune + costs (GPU/image).")
+                print("  RUN_HEAVY=0; skipping CE-finetune + costs + SupCon multi-seed (GPU/image).")
             # §K/§L completeness pass — fill any method × experiment cell still empty.
             # Opt-in (default off) and idempotent: a normal run is unaffected.
             _opt("RUN_FILL_MISSING", "0", lambda: __import__("swid_retrieval.experiments.fill_missing", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
