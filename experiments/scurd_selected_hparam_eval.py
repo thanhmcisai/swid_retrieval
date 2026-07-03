@@ -181,15 +181,34 @@ def run(run_root, force=False):
             "This audit reuses the configured projected embeddings."
         )
     rows = []
-    deploy, M_dep, _ = _row_for_scope("id_only", selected, with_exp4=True)
-    rows.append(deploy)
-    full, _, _ = _row_for_scope("full_swi", selected, with_exp4=False)
-    rows.append(full)
+    scopes = [
+        s.strip()
+        for s in os.environ.get("SCURD_SELECTED_EVAL_SCOPES", "id_only").split(",")
+        if s.strip()
+    ]
+    if not scopes:
+        scopes = ["id_only"]
+    M_dep = None
+    for scope in scopes:
+        if scope == "id_only":
+            row, M_scope, _ = _row_for_scope("id_only", selected, with_exp4=True)
+            M_dep = M_scope
+        elif scope == "full_swi":
+            row, _, _ = _row_for_scope("full_swi", selected, with_exp4=False)
+            row["note"] = "Full-SWI selected-hparam evaluation is memory-intensive."
+        else:
+            raise ValueError(
+                f"Unknown SCURD_SELECTED_EVAL_SCOPES entry {scope!r}; use id_only and optionally full_swi."
+            )
+        rows.append(row)
+    if M_dep is None:
+        _, M_dep, _ = _row_for_scope("id_only", selected, with_exp4=True)
     kshot = _ood_kshot(M_dep["SC-URD"], selected, K=10, n_reps=int(os.environ.get("SCURD_SELECTED_KSHOT_REPS", "50")))
 
     out = {
         "selected_source": str(selected_path),
         "selected": selected,
+        "eval_scopes": scopes,
         "rows": rows,
         "ood_only_kshot_K10": kshot,
         "note": (

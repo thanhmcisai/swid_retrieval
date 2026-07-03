@@ -109,6 +109,10 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
   centered-configuration results.
 - `FORCE_SCURD_SELECTED_HPARAM_EVAL=1` — recompute
   `native_experiments/scurd_selected_hparam_eval.{csv,json}` even if present.
+- `SCURD_SELECTED_EVAL_SCOPES=id_only` — scopes evaluated by the selected
+  SC-URD hyperparameter audit. Keep the default `id_only` on Colab; adding
+  `full_swi` is memory-intensive because it scores against the 176k-image SWI
+  gallery.
 - `SKIP_BUILD_FULL954_CACHE=1`, `SKIP_DEPLOYMENT_PASS=1`,
   `SKIP_PARADIGM_PASS=1`, `SKIP_REVIEW_PASS=1`, `SKIP_EDGE_PROXY=1`,
   `SKIP_CE_TRAIN_PASS=1`, `SKIP_NATIVE_EXPERIMENTS=1`, `SKIP_SANITY=1`,
