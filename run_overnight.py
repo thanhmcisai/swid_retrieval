@@ -61,6 +61,7 @@ _DEFAULTS = {
     "RUN_CE_TRAIN_ROBUSTNESS": "1",       # ce_train pass: full gallery-dependent suite
     "RUN_HEAVY": "1",                     # paper cost tables require CE-finetune + costs
     "RUN_CLASS_INCREMENTAL": "1",         # stronger CE adaptation control
+    "RUN_SCURD_SELECTED_HPARAM_EVAL": "1",# evaluate meta-val selected SC-URD scorer
     "RUN_SCURD_BACKBONE": "1",            # paper tab:scurd_backbone
     # Overnight operation.
     "STRICT_SANITY": "0",                 # warn (don't crash) if the gate trips

@@ -104,6 +104,11 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
   SC-URD meta-val hyperparameter-selection audit.
 - `FORCE_HYPERPARAM_SELECTION=1` — recompute
   `hyperparameters/scurd_hyperparameter_selection.{csv,json}` even if present.
+- `RUN_SCURD_SELECTED_HPARAM_EVAL=0` — skip the post-selection audit that
+  evaluates the meta-val selected SC-URD scorer without overwriting main
+  centered-configuration results.
+- `FORCE_SCURD_SELECTED_HPARAM_EVAL=1` — recompute
+  `native_experiments/scurd_selected_hparam_eval.{csv,json}` even if present.
 - `SKIP_BUILD_FULL954_CACHE=1`, `SKIP_DEPLOYMENT_PASS=1`,
   `SKIP_PARADIGM_PASS=1`, `SKIP_REVIEW_PASS=1`, `SKIP_EDGE_PROXY=1`,
   `SKIP_CE_TRAIN_PASS=1`, `SKIP_NATIVE_EXPERIMENTS=1`, `SKIP_SANITY=1`,

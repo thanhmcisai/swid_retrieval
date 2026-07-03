@@ -33,6 +33,8 @@ JSON_RESULTS = [
     "native_experiments/centering_ablation.json",
     "native_experiments/fill_missing_ablation.json",
     "native_experiments/exp3_ce_finetune.json",
+    "native_experiments/class_incremental_baseline.json",
+    "native_experiments/scurd_selected_hparam_eval.json",
     "native_experiments/deployment_search_cost.json",
     "hyperparameters/scurd_hyperparameter_selection.json",
     "cross_experiment_summary.json",
