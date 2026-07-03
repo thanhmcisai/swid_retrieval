@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .. import config
-from ..data import CachedImageLoader, canonical_label, get_transforms
+from ..data import CachedImageLoader, canonical_label, get_transforms, full_swi_items, load_swi_manifest
 from . import registry as R
 
 RQ3_CIL_EPOCHS = int(os.environ.get("RQ3_CIL_EPOCHS", "30"))
@@ -24,6 +24,7 @@ RQ3_CIL_LR = float(os.environ.get("RQ3_CIL_LR", "1e-3"))
 RQ3_CIL_BATCH_SIZE = int(os.environ.get("RQ3_CIL_BATCH_SIZE", "32"))
 RQ3_CIL_OLD_CALIB_PER_SPECIES = int(os.environ.get("RQ3_CIL_OLD_CALIB_PER_SPECIES", "10"))
 RQ3_CIL_REHEARSAL_EPOCHS = int(os.environ.get("RQ3_CIL_REHEARSAL_EPOCHS", str(RQ3_CIL_EPOCHS)))
+RQ3_CIL_MATCHED_OLD_K = int(os.environ.get("RQ3_CIL_MATCHED_OLD_K", str(RQ3_CIL_OLD_CALIB_PER_SPECIES)))
 
 
 def _extract_features(model, paths, device, batch_size=64):
@@ -121,6 +122,22 @@ def run(ctx, out_dir, K=10, seed=42):
     x_old_calib = _extract_features(model_ce, old_calib_paths, dev).cpu()
     x_new_query = _extract_features(model_ce, new_query_paths, dev).cpu()
 
+    manifest = load_swi_manifest()
+    swi_by_sp = {}
+    for path, sp in full_swi_items(manifest):
+        c = canonical_label(sp)
+        if c in sp_to_old_idx:
+            swi_by_sp.setdefault(c, []).append(str(path))
+    old_swi_paths, old_swi_y = [], []
+    for sp in sorted(id_splits):
+        refs = sorted(swi_by_sp.get(sp, []))[:RQ3_CIL_MATCHED_OLD_K]
+        old_swi_paths.extend(refs)
+        old_swi_y.extend([sp_to_old_idx[sp]] * len(refs))
+    if len({int(y) for y in old_swi_y}) != len(id_splits):
+        missing = [sp for sp in sorted(id_splits) if not swi_by_sp.get(sp)]
+        raise RuntimeError(f"Missing SWI matched old references for public-ID species: {missing[:10]}")
+    x_old_swi = _extract_features(model_ce, old_swi_paths, dev).cpu()
+
     def _logits_from_feats(feats, gamma_new=0.0):
         logits_old = feats @ old_w.T + old_b
         logits_new = feats @ new_w_cpu.T + new_b_cpu - float(gamma_new)
@@ -163,50 +180,55 @@ def run(ctx, out_dir, K=10, seed=42):
     old_per_cal = _acc_by_species(old_blocks, x_old_query, gamma_new=best_gamma)
     new_per_cal = _acc_by_species(new_blocks, x_new_query, gamma_new=best_gamma)
 
-    # Rehearsal CE control: train a classifier head on frozen CE features using
-    # old public-ID exemplars plus new K-shot references. Only rehearsed old rows
-    # and new rows are allowed to move; the remaining 930 old rows stay fixed.
-    reh_w = nn.Parameter(torch.cat([old_w, new_w_cpu], dim=0).clone().to(dev))
-    reh_b = nn.Parameter(torch.cat([old_b, new_b_cpu], dim=0).clone().to(dev))
-    x_reh = torch.cat([x_old_calib, x_train.cpu()], dim=0)
-    y_reh = torch.tensor(old_calib_y + ft_y, dtype=torch.long)
-    reh_ds = TensorDataset(x_reh, y_reh)
-    reh_dl = DataLoader(reh_ds, batch_size=RQ3_CIL_BATCH_SIZE, shuffle=True)
-    movable_rows = torch.zeros(n_old + len(new_species), dtype=torch.bool, device=dev)
-    for sp in sorted(id_splits):
-        movable_rows[sp_to_old_idx[sp]] = True
-    movable_rows[n_old:] = True
-    reh_opt = torch.optim.AdamW([reh_w, reh_b], lr=RQ3_CIL_LR, weight_decay=1e-4)
-    for _ in range(RQ3_CIL_REHEARSAL_EPOCHS):
-        for xb, yb in reh_dl:
-            xb = xb.to(dev)
-            yb = yb.to(dev)
-            logits = xb @ reh_w.T + reh_b
-            loss = F.cross_entropy(logits, yb)
-            reh_opt.zero_grad()
-            loss.backward()
-            with torch.no_grad():
-                reh_w.grad[~movable_rows] = 0
-                reh_b.grad[~movable_rows] = 0
-            reh_opt.step()
-    reh_w_cpu = reh_w.detach().cpu()
-    reh_b_cpu = reh_b.detach().cpu()
+    def _train_rehearsal_head(x_old_ref, old_ref_y):
+        # Train a classifier head on frozen CE features using old exemplars plus
+        # new K-shot references. Only rehearsed old rows and new rows can move;
+        # the remaining old rows stay fixed.
+        reh_w = nn.Parameter(torch.cat([old_w, new_w_cpu], dim=0).clone().to(dev))
+        reh_b = nn.Parameter(torch.cat([old_b, new_b_cpu], dim=0).clone().to(dev))
+        x_reh = torch.cat([x_old_ref, x_train.cpu()], dim=0)
+        y_reh = torch.tensor(list(old_ref_y) + ft_y, dtype=torch.long)
+        reh_ds = TensorDataset(x_reh, y_reh)
+        reh_dl = DataLoader(reh_ds, batch_size=RQ3_CIL_BATCH_SIZE, shuffle=True)
+        movable_rows = torch.zeros(n_old + len(new_species), dtype=torch.bool, device=dev)
+        for y in set(old_ref_y):
+            movable_rows[int(y)] = True
+        movable_rows[n_old:] = True
+        reh_opt = torch.optim.AdamW([reh_w, reh_b], lr=RQ3_CIL_LR, weight_decay=1e-4)
+        for _ in range(RQ3_CIL_REHEARSAL_EPOCHS):
+            for xb, yb in reh_dl:
+                xb = xb.to(dev)
+                yb = yb.to(dev)
+                logits = xb @ reh_w.T + reh_b
+                loss = F.cross_entropy(logits, yb)
+                reh_opt.zero_grad()
+                loss.backward()
+                with torch.no_grad():
+                    reh_w.grad[~movable_rows] = 0
+                    reh_b.grad[~movable_rows] = 0
+                reh_opt.step()
+        reh_w_cpu = reh_w.detach().cpu()
+        reh_b_cpu = reh_b.detach().cpu()
 
-    def _predict_rehearsal(feats):
-        pred = (feats @ reh_w_cpu.T + reh_b_cpu).argmax(1).numpy()
-        return np.asarray([all_species[int(i)] for i in pred])
+        def _predict_rehearsal(feats):
+            pred = (feats @ reh_w_cpu.T + reh_b_cpu).argmax(1).numpy()
+            return np.asarray([all_species[int(i)] for i in pred])
 
-    pred_old_reh = _predict_rehearsal(x_old_query)
-    pred_new_reh = _predict_rehearsal(x_new_query)
-    old_reh_per, new_reh_per = {}, {}
-    off = 0
-    for sp, n in old_blocks:
-        old_reh_per[sp] = float((pred_old_reh[off:off + n] == sp).mean()) if n else 0.0
-        off += n
-    off = 0
-    for sp, n in new_blocks:
-        new_reh_per[sp] = float((pred_new_reh[off:off + n] == sp).mean()) if n else 0.0
-        off += n
+        pred_old = _predict_rehearsal(x_old_query)
+        pred_new = _predict_rehearsal(x_new_query)
+        old_per_out, new_per_out = {}, {}
+        off = 0
+        for sp, n in old_blocks:
+            old_per_out[sp] = float((pred_old[off:off + n] == sp).mean()) if n else 0.0
+            off += n
+        off = 0
+        for sp, n in new_blocks:
+            new_per_out[sp] = float((pred_new[off:off + n] == sp).mean()) if n else 0.0
+            off += n
+        return old_per_out, new_per_out
+
+    old_reh_per, new_reh_per = _train_rehearsal_head(x_old_calib, old_calib_y)
+    old_reh_swi_per, new_reh_swi_per = _train_rehearsal_head(x_old_swi, old_swi_y)
 
     def _proto_predict(q_feats, proto_mat, proto_labels):
         q = q_feats.numpy()
@@ -214,34 +236,39 @@ def run(ctx, out_dir, K=10, seed=42):
         sims = q @ proto_mat.T
         return np.asarray(proto_labels)[sims.argmax(axis=1)]
 
-    proto_vecs, proto_labels = [], []
-    old_calib_y = np.asarray(old_calib_y)
-    old_cal_np = x_old_calib.numpy()
-    for sp in sorted(id_splits):
-        idx = np.where(old_calib_y == sp_to_old_idx[sp])[0]
-        if len(idx):
-            proto_vecs.append(old_cal_np[idx].mean(axis=0))
-            proto_labels.append(sp)
-    x_train_np = x_train.numpy()
-    ft_y_np = np.asarray(ft_y)
-    for sp in new_species:
-        idx = np.where(ft_y_np == new_to_idx[sp])[0]
-        if len(idx):
-            proto_vecs.append(x_train_np[idx].mean(axis=0))
-            proto_labels.append(sp)
-    proto_mat = np.asarray(proto_vecs, dtype=np.float32)
-    proto_mat = proto_mat / np.maximum(np.linalg.norm(proto_mat, axis=1, keepdims=True), 1e-12)
-    pred_old_proto = _proto_predict(x_old_query, proto_mat, proto_labels)
-    pred_new_proto = _proto_predict(x_new_query, proto_mat, proto_labels)
-    old_proto_per, new_proto_per = {}, {}
-    off = 0
-    for sp, n in old_blocks:
-        old_proto_per[sp] = float((pred_old_proto[off:off + n] == sp).mean()) if n else 0.0
-        off += n
-    off = 0
-    for sp, n in new_blocks:
-        new_proto_per[sp] = float((pred_new_proto[off:off + n] == sp).mean()) if n else 0.0
-        off += n
+    def _icarl_eval(x_old_ref, old_ref_y):
+        proto_vecs, proto_labels = [], []
+        old_ref_y = np.asarray(old_ref_y)
+        old_ref_np = x_old_ref.numpy()
+        for sp in sorted(id_splits):
+            idx = np.where(old_ref_y == sp_to_old_idx[sp])[0]
+            if len(idx):
+                proto_vecs.append(old_ref_np[idx].mean(axis=0))
+                proto_labels.append(sp)
+        x_train_np = x_train.numpy()
+        ft_y_np = np.asarray(ft_y)
+        for sp in new_species:
+            idx = np.where(ft_y_np == new_to_idx[sp])[0]
+            if len(idx):
+                proto_vecs.append(x_train_np[idx].mean(axis=0))
+                proto_labels.append(sp)
+        proto_mat = np.asarray(proto_vecs, dtype=np.float32)
+        proto_mat = proto_mat / np.maximum(np.linalg.norm(proto_mat, axis=1, keepdims=True), 1e-12)
+        pred_old_proto = _proto_predict(x_old_query, proto_mat, proto_labels)
+        pred_new_proto = _proto_predict(x_new_query, proto_mat, proto_labels)
+        old_proto_per, new_proto_per = {}, {}
+        off = 0
+        for sp, n in old_blocks:
+            old_proto_per[sp] = float((pred_old_proto[off:off + n] == sp).mean()) if n else 0.0
+            off += n
+        off = 0
+        for sp, n in new_blocks:
+            new_proto_per[sp] = float((pred_new_proto[off:off + n] == sp).mean()) if n else 0.0
+            off += n
+        return old_proto_per, new_proto_per
+
+    old_proto_per, new_proto_per = _icarl_eval(x_old_calib, old_calib_y)
+    old_proto_swi_per, new_proto_swi_per = _icarl_eval(x_old_swi, old_swi_y)
 
     variants = [
         {
@@ -284,6 +311,23 @@ def run(ctx, out_dir, K=10, seed=42):
             "note": "CE rehearsal on frozen CE features using old public-ID exemplars plus new K-shot references; non-rehearsed old rows remain frozen.",
         },
         {
+            "strategy": "ce_rehearsal_frozen_features_matched_swi_refs",
+            "acc_old_id_species": float(np.mean(list(old_reh_swi_per.values()))),
+            "acc_new_species": float(np.mean(list(new_reh_swi_per.values()))),
+            "method_family": "cross-entropy rehearsal",
+            "updates_backbone": False,
+            "updates_old_class_rows": True,
+            "updates_only_rehearsed_old_rows": True,
+            "uses_rehearsal": True,
+            "old_reference_source": "SWI gallery, public-ID species only",
+            "old_calib_images_per_species": int(RQ3_CIL_MATCHED_OLD_K),
+            "new_exemplars_per_species": int(K),
+            "n_epochs": int(RQ3_CIL_REHEARSAL_EPOCHS),
+            "lr": float(RQ3_CIL_LR),
+            "calibration_gamma_new": None,
+            "note": "Matched-reference CE rehearsal: old exemplars come from SWI references for the 24 public-ID species, matching the retrieval old-gallery source rather than public same-domain old pools.",
+        },
+        {
             "strategy": "icarl_nearest_exemplar_mean",
             "acc_old_id_species": float(np.mean(list(old_proto_per.values()))),
             "acc_new_species": float(np.mean(list(new_proto_per.values()))),
@@ -295,6 +339,20 @@ def run(ctx, out_dir, K=10, seed=42):
             "new_exemplars_per_species": int(K),
             "calibration_gamma_new": None,
             "note": "iCaRL-style NME baseline on frozen CE features: old public-ID pool exemplars and new K-shot exemplars form class means; no representation retraining is performed.",
+        },
+        {
+            "strategy": "icarl_nearest_exemplar_mean_matched_swi_refs",
+            "acc_old_id_species": float(np.mean(list(old_proto_swi_per.values()))),
+            "acc_new_species": float(np.mean(list(new_proto_swi_per.values()))),
+            "method_family": "iCaRL-style nearest-mean-of-exemplars",
+            "updates_backbone": False,
+            "updates_old_class_rows": False,
+            "uses_rehearsal": True,
+            "old_reference_source": "SWI gallery, public-ID species only",
+            "old_calib_images_per_species": int(RQ3_CIL_MATCHED_OLD_K),
+            "new_exemplars_per_species": int(K),
+            "calibration_gamma_new": None,
+            "note": "Matched-reference iCaRL-style NME: old class means use SWI references for the 24 public-ID species and new class means use OOD K-shot references.",
         },
     ]
 
@@ -317,8 +375,12 @@ def run(ctx, out_dir, K=10, seed=42):
         "calibrated_new_per_species": new_per_cal,
         "rehearsal_old_per_species": old_reh_per,
         "rehearsal_new_per_species": new_reh_per,
+        "rehearsal_matched_swi_old_per_species": old_reh_swi_per,
+        "rehearsal_matched_swi_new_per_species": new_reh_swi_per,
         "icarl_old_per_species": old_proto_per,
         "icarl_new_per_species": new_proto_per,
+        "icarl_matched_swi_old_per_species": old_proto_swi_per,
+        "icarl_matched_swi_new_per_species": new_proto_swi_per,
         "note": "Top-level metrics preserve the original new-rows-only baseline. See variants for bias-calibrated and iCaRL-style exemplar-mean controls.",
     }
     os.makedirs(str(out_dir), exist_ok=True)

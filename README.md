@@ -126,6 +126,8 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
   (`native_experiments/class_incremental_baseline.{json,csv}`).
 - `RQ3_CIL_OLD_CALIB_PER_SPECIES=10` — number of old public-ID pool exemplars
   per species used by the class-incremental calibration/iCaRL-style controls.
+- `RQ3_CIL_MATCHED_OLD_K=10` — number of old SWI-gallery references per
+  public-ID species used by the matched-reference rehearsal/iCaRL controls.
 - `RQ3_CIL_REHEARSAL_EPOCHS=30` — epochs for the frozen-feature CE rehearsal
   control.
 - `RUN_SCURD_BACKBONE=0` — skip SC-URD alternate-backbone ablation
