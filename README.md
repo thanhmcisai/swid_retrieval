@@ -121,7 +121,11 @@ rendered in the final step (`RUN_VISUALIZE=1`); regenerate standalone with
 - `RUN_HEAVY=0` — skip CE fine-tune and cost artifacts (`tab:deployment_cost`,
   `tab:inference_cost` will be missing).
 - `RUN_CLASS_INCREMENTAL=0` — skip the stronger frozen-old-row CE
-  class-incremental control (`native_experiments/class_incremental_baseline.json`).
+  class-incremental controls, including bias-calibrated new rows and an
+  iCaRL-style nearest-exemplar-mean baseline
+  (`native_experiments/class_incremental_baseline.{json,csv}`).
+- `RQ3_CIL_OLD_CALIB_PER_SPECIES=10` — number of old public-ID pool exemplars
+  per species used by the class-incremental calibration/iCaRL-style controls.
 - `RUN_SCURD_BACKBONE=0` — skip SC-URD alternate-backbone ablation
   (`tab:scurd_backbone` will be missing).
 - `RUN_INTERPRETABILITY=0` — do not regenerate occlusion saliency images; the

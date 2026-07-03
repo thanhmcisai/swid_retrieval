@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Class-incremental CE baseline with frozen old-class rows.
+"""Class-incremental CE baselines for the adaptation table.
 
-This is a stronger control than naive CE fine-tuning for the adaptation table:
-the CE-Full backbone/head and old classifier rows are frozen, and only 50 new
-classifier rows are trained from K=10 OOD references. It tests whether the
-old=0 collapse in the naive fine-tune rows is an intrinsic classifier limit or a
-no-rehearsal/trainable-old-row artifact.
+These are stronger controls than naive CE fine-tuning: old classifier rows are
+frozen, optional calibration uses old reference exemplars, and an iCaRL-style
+nearest-exemplar-mean baseline evaluates whether a continual classifier with
+exemplar memory converges toward the retrieval/prototype interface.
 """
 
 import json
@@ -222,15 +221,17 @@ def run(ctx, out_dir, K=10, seed=42):
             "note": "New-row logits are bias-calibrated on old reference-pool images and new K-shot references only.",
         },
         {
-            "strategy": "frozen_ce_feature_nearest_prototype",
+            "strategy": "icarl_nearest_exemplar_mean",
             "acc_old_id_species": float(np.mean(list(old_proto_per.values()))),
             "acc_new_species": float(np.mean(list(new_proto_per.values()))),
+            "method_family": "iCaRL-style nearest-mean-of-exemplars",
             "updates_backbone": False,
             "updates_old_class_rows": False,
             "uses_rehearsal": True,
             "old_calib_images_per_species": int(RQ3_CIL_OLD_CALIB_PER_SPECIES),
+            "new_exemplars_per_species": int(K),
             "calibration_gamma_new": None,
-            "note": "Frozen CE features classified by nearest old/new reference prototypes; this is a classifier-feature CIL control that approaches retrieval.",
+            "note": "iCaRL-style NME baseline on frozen CE features: old public-ID pool exemplars and new K-shot exemplars form class means; no representation retraining is performed.",
         },
     ]
 
@@ -251,9 +252,9 @@ def run(ctx, out_dir, K=10, seed=42):
         "variants": variants,
         "calibrated_old_per_species": old_per_cal,
         "calibrated_new_per_species": new_per_cal,
-        "prototype_old_per_species": old_proto_per,
-        "prototype_new_per_species": new_proto_per,
-        "note": "Top-level metrics preserve the original new-rows-only baseline. See variants for bias-calibrated and prototype controls.",
+        "icarl_old_per_species": old_proto_per,
+        "icarl_new_per_species": new_proto_per,
+        "note": "Top-level metrics preserve the original new-rows-only baseline. See variants for bias-calibrated and iCaRL-style exemplar-mean controls.",
     }
     os.makedirs(str(out_dir), exist_ok=True)
     path = os.path.join(str(out_dir), "class_incremental_baseline.json")
