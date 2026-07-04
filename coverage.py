@@ -52,6 +52,9 @@ TABLE_SOURCES = {
     "tab:appendix_fpr95_ci": "deployment/variance_evidence/fpr95_difference_bootstrap_ci_full_gallery.csv",
     "tab:appendix_ood_extended": "native_experiments/rq2_ood_extended.json",
     "tab:ood_within_source": "native_experiments/ood_within_source.csv",
+    "tab:class_geometry": "native_experiments/class_geometry_summary.csv",
+    "tab:geometry_bridge": "native_experiments/class_geometry_correlations.csv",
+    "tab:genus_level": "native_experiments/genus_level_retrieval.csv",
     "tab:ood_by_source": "deployment/variance_evidence/ood_by_source_scurd_full_gallery.csv",
     "tab:appendix_ood_kshot": "native_experiments/rq2_kshot.json",
     # Failure taxonomy is discussed as deployment behaviour; use the 24-species
@@ -69,6 +72,7 @@ TABLE_SOURCES = {
 FIG_STEMS = ["fig2a_rq1_paradigm", "fig2b_rq1_gallery_strategy", "fig3a_rq2_ood_detection",
              "fig3b_rq2_openset_retrieval", "fig5a_rq4_swi_to_vn26", "fig5b_rq4_cross_magnification",
              "fig6a_rq5_backbone_loss", "fig6b_rq5_scurd_ablation", "fig6_rq5_scurd_ablation",
+             "fig_class_geometry", "fig_genus_retrieval",
              "fig_discussion_rq5_tradeoff", "fig_discussion_rq3_stability_plasticity",
              "fig_discussion_ood_score_distribution"]
 STATIC_FIG_FILES = ["sc_urd_architecture_py.png",

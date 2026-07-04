@@ -272,6 +272,50 @@ def fig_kshot(nat_dir, fig_dir):
     _save(fig, fig_dir / "kshot.pdf"); plt.close(fig)
 
 
+def fig_class_geometry(nat_dir, fig_dir):
+    """Reference-matching geometry: same-species spread vs inter-class separation."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    df = _read_csv(nat_dir / "class_geometry_summary.csv")
+    if df is None or df.empty:
+        print("  skip class_geometry (no csv)"); return
+    methods = df["method"].tolist()
+    cols = [
+        ("same_species_mean_distance", "same species"),
+        ("same_genus_inter_mean_distance", "same genus\nother species"),
+        ("different_genus_inter_mean_distance", "different genus"),
+    ]
+    x = np.arange(len(methods)); w = 0.25
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    for i, (col, label) in enumerate(cols):
+        if col in df:
+            ax.bar(x + (i - 1) * w, df[col].astype(float), w, label=label)
+    ax.set_xticks(x); ax.set_xticklabels(methods, rotation=20, ha="right")
+    ax.set_ylabel("cosine distance")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    _save(fig, fig_dir / "fig_class_geometry.pdf"); plt.close(fig)
+
+
+def fig_genus_retrieval(nat_dir, fig_dir):
+    """Species-level vs genus-level retrieval under the deployment gallery."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    df = _read_csv(nat_dir / "genus_level_retrieval.csv")
+    if df is None or df.empty:
+        print("  skip genus_retrieval (no csv)"); return
+    methods = df["method"].tolist()
+    x = np.arange(len(methods)); w = 0.38
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    ax.bar(x - w / 2, df["species_macro_r1"].astype(float), w, label="species R@1")
+    ax.bar(x + w / 2, df["genus_macro_r1"].astype(float), w, label="genus R@1")
+    ax.set_xticks(x); ax.set_xticklabels(methods, rotation=20, ha="right")
+    ax.set_ylabel("macro accuracy")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    _save(fig, fig_dir / "fig_genus_retrieval.pdf"); plt.close(fig)
+
+
 # ── SC-URD memory-mode ablation + discussion figures (paper fig6b / fig6 / fig_discussion_*) ──
 # Ported from generate_all_figures_from_json.py (fig6b_scurd L453, fig6_compound L499,
 # fig_discussion_rq3 L552, fig_discussion_rq5 L586, fig_discussion_ood L635), re-pointed
@@ -445,7 +489,9 @@ def main(argv=None):
                lambda: fig_discussion_ood(nat, fig_dir),
                lambda: fig_robustness(rd, fig_dir),
                lambda: fig_vn26(nat, fig_dir),
-               lambda: fig_kshot(nat, fig_dir)):
+               lambda: fig_kshot(nat, fig_dir),
+               lambda: fig_class_geometry(nat, fig_dir),
+               lambda: fig_genus_retrieval(nat, fig_dir)):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

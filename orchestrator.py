@@ -442,6 +442,7 @@ def main():
             _opt("RUN_RQ4_VN26", "1", lambda: __import__("swid_retrieval.experiments.rq4_vn26", fromlist=["run"]).run(M_dep, nat_dir))
             _opt("RUN_OOD_BASELINES", "1", lambda: __import__("swid_retrieval.experiments.ood_baselines", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
             _opt("RUN_OOD_WITHIN_SOURCE", "1", lambda: __import__("swid_retrieval.experiments.ood_within_source", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
+            _opt("RUN_CLASS_GEOMETRY", "1", lambda: __import__("swid_retrieval.experiments.class_geometry", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
             _opt("RUN_OOD_KSHOT", "1", lambda: __import__("swid_retrieval.experiments.kshot_openset", fromlist=["run"]).run(M_dep, nat_dir))
             _opt("RUN_RQ5_EXTRA", "1", lambda: __import__("swid_retrieval.experiments.rq5_ablation_extra", fromlist=["run"]).run(M_dep, ctx_dep, nat_dir))
             _opt("RUN_SCURD_SELECTED_HPARAM_EVAL", "1", lambda: __import__("swid_retrieval.experiments.scurd_selected_hparam_eval", fromlist=["run"]).run(run_root))

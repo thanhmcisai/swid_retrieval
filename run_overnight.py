@@ -65,6 +65,7 @@ _DEFAULTS = {
     "RUN_SCURD_SELECTED_HPARAM_EVAL": "1",# evaluate meta-val selected SC-URD scorer
     "RUN_SCURD_TRAINING_ABLATION": "1",   # REV-1/2: lr + consistency ablations
     "RUN_OOD_WITHIN_SOURCE": "1",         # REV-4: source-controlled OOD protocol
+    "RUN_CLASS_GEOMETRY": "1",            # RF/GEO: reference-matching geometry diagnostics
     "RUN_SUPCON_SEED_SENSITIVITY": "0",   # REV-3: opt-in, trains/extracts image backbones
     "RUN_SCURD_BACKBONE": "1",            # paper tab:scurd_backbone
     # Overnight operation.
