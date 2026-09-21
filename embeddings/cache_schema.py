@@ -2,8 +2,9 @@
 """Embedding-cache key schema.
 
 Mirrors _EMB_VAR_NAMES (final_metric_learning_cea_2026.py:1841-1859). The
-full-954 builder re-extracts only the SWI-gallery side; everything on the
-ID/OOD query side is copied verbatim from the source meta-test cache.
+full-954 builder always re-extracts the SWI-gallery side. The public ID/OOD
+query side is copied from the source cache by default, or re-extracted from the
+active corrected CSVs when REEXTRACT_PUBLIC_QUERIES=1.
 """
 
 from .. import config
@@ -21,8 +22,8 @@ SWI_BASE_KEYS = [
 SWI_VARIANT_KEYS = [f"embs_swi_{t}" for t in VARIANT_TAGS]
 SWI_KEYS = SWI_BASE_KEYS + SWI_VARIANT_KEYS
 
-# Query-side prefixes copied unchanged from the source cache (independent of
-# the SWI gallery scope: public-ID and public-OOD are external images).
+# Query-side prefixes copied or re-extracted as a group (independent of the SWI
+# gallery scope: public-ID and public-OOD are external images).
 COPY_PREFIXES = (
     "embs_id_", "labels_id_", "logits_id_",
     "embs_ood_", "labels_ood_", "logits_ood_",

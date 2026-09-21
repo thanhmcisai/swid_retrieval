@@ -4,10 +4,10 @@
 THE unblocking step. embedding_cache_v3.npz holds SWI embeddings for only the
 ~317-species meta-test split, so the corrected `full_swi` protocol crashes the
 `>= 900 species` assertion. This module re-extracts the SWI-gallery side over all
-954 species (meta-train ∪ meta-val ∪ meta-test) for every backbone, COPIES the
-unchanged public-ID / public-OOD query embeddings from the old cache, and writes
-embedding_cache_full954_v3.npz (+ provenance sidecar). The old cache and all
-paper_reframe outputs are left untouched.
+954 species (meta-train ∪ meta-val ∪ meta-test) for every backbone. By default it
+copies the public-ID / public-OOD query embeddings from the source cache; set
+REEXTRACT_PUBLIC_QUERIES=1 after retraining a checkpoint so the public side is
+also extracted from the current models and corrected CSVs.
 
 Idempotent: skips if a valid full-954 cache already exists (FORCE_REBUILD_FULL954=1
 to override). Resumable: with SAVE_PARTIAL=1 each backbone's SWI embeddings are
@@ -22,7 +22,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from .. import config
-from ..data import (ManifestDataset, get_transforms, canonical_label,
+from ..data import (ManifestDataset, CSVImageDataset, get_transforms, canonical_label,
                     load_swi_manifest, full_swi_items, ce_train_image_paths,
                     preload_image_cache, collect_all_image_paths)
 from ..models import build_models
@@ -42,6 +42,9 @@ def _cache_is_valid(cache_path, meta_path, min_species):
 
 
 def _load_partial(partial_path):
+    if os.environ.get("IGNORE_PARTIAL_CACHE", "0") == "1":
+        print("ℹ️  IGNORE_PARTIAL_CACHE=1; starting SWI extraction from scratch.")
+        return {}
     if config.SAVE_PARTIAL and Path(partial_path).exists():
         try:
             p = np.load(partial_path, allow_pickle=False)
@@ -58,6 +61,63 @@ def _save_partial(swi_data, partial_path):
         np.savez(partial_path, **swi_data)
 
 
+def _public_items(df):
+    return [(str(row["file_path"]), canonical_label(row["label"])) for _, row in df.iterrows()]
+
+
+def _extract_public_side(side, csv_path, models, tfs, device):
+    """Extract public-ID/OOD query embeddings from the active corrected CSV.
+
+    Mirrors the original cache schema. The ID side has every model family; the
+    OOD side intentionally follows the old schema and omits ImageNet/CLIP labels.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    if "file_path" not in df.columns or "label" not in df.columns:
+        raise ValueError(f"{csv_path} must contain file_path and label columns")
+    ds = CSVImageDataset(df, transform=get_transforms(224, augment=False))
+    loader = DataLoader(ds, batch_size=64, num_workers=config.num_workers(),
+                        pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    items = _public_items(df)
+    labels = np.asarray([label for _, label in items])
+    out = {}
+
+    if side == "id":
+        out[f"embs_{side}_imagenet"], _ = extract_embeddings(models["imagenet"], loader, device)
+
+    out[f"embs_{side}_arc"], _ = extract_embeddings(models["arc"], loader, device)
+    out[f"embs_{side}_arc954"], _ = extract_embeddings(models["arc954"], loader, device)
+    out[f"embs_{side}_proto"], _ = extract_embeddings(models["proto"], loader, device)
+
+    norm, _, logits = extract_embeddings(models["ce"], loader, device, return_logits=True)
+    out[f"embs_{side}_ce_full_norm"] = norm
+    out[f"logits_{side}_ce_full"] = logits
+    out[f"embs_{side}_ce_full_raw"] = extract_embeddings_raw(models["ce"], loader, device)
+
+    norm, _, logits = extract_embeddings(models["ce_narrow"], loader, device, return_logits=True)
+    out[f"embs_{side}_ce_narrow_norm"] = norm
+    out[f"logits_{side}_ce_narrow"] = logits
+    if side == "id":
+        out[f"embs_{side}_ce_narrow_raw"] = extract_embeddings_raw(models["ce_narrow"], loader, device)
+
+    for tag in cache_schema.VARIANT_TAGS:
+        out[f"embs_{side}_{tag}"], _ = extract_embeddings(models[tag], loader, device)
+
+    if side == "id":
+        out[f"embs_{side}_clip"], out[f"labels_{side}_clip"] = extract_clip_embeddings(
+            models["clip"], items, tfs["clip"], device)
+    out[f"embs_{side}_dinov2"], out[f"labels_{side}_dinov2"] = extract_dinov2_embeddings(
+        models["dinov2"], items, tfs["dinov2"], device)
+
+    # Guard all extracted arrays against accidental row drift.
+    for key, arr in out.items():
+        if len(arr) != len(labels):
+            raise ValueError(f"{key} has {len(arr)} rows, expected {len(labels)} from {csv_path}")
+    print(f"✅ Re-extracted public {side.upper()}: {len(labels)} images, {len(set(labels))} species")
+    return out
+
+
 def build(device=None, force=None):
     device = device or config.resolve_device()
     force = config.FORCE_REBUILD_FULL954 if force is None else force
@@ -67,7 +127,8 @@ def build(device=None, force=None):
         print(f"✅ Full-954 cache already valid: {config.FULL954_CACHE_PATH} (skip; FORCE_REBUILD_FULL954=1 to rebuild)")
         return config.FULL954_CACHE_PATH
 
-    if not config.SOURCE_EMB_CACHE_PATH.exists():
+    reextract_public = os.environ.get("REEXTRACT_PUBLIC_QUERIES", "0") == "1"
+    if not reextract_public and not config.SOURCE_EMB_CACHE_PATH.exists():
         raise FileNotFoundError(
             f"Source meta-test cache not found: {config.SOURCE_EMB_CACHE_PATH}. "
             "It supplies the unchanged public-ID/OOD query embeddings.")
@@ -192,17 +253,29 @@ def build(device=None, force=None):
     print(f"CE-train robustness mask: {int(swi_in_ce_train.sum())}/{n_rows} gallery images "
           f"({n_ce_species} species) are in CE-Full's train partition (seed={ce_seed})")
 
-    # ── Copy unchanged ID/OOD query embeddings from the source cache ────────
-    src = np.load(config.SOURCE_EMB_CACHE_PATH, allow_pickle=False)
-    copied = {k: src[k] for k in src.files if cache_schema.is_copy_key(k)}
-    if not copied:
-        raise KeyError(f"No id/ood query keys found in {config.SOURCE_EMB_CACHE_PATH}.")
-    print(f"Copied {len(copied)} unchanged ID/OOD query keys from {config.SOURCE_EMB_CACHE_NAME}")
+    # ── Public ID/OOD query side ────────────────────────────────────────────
+    if reextract_public:
+        if not config.ID_IMAGES_CSV.exists() or not config.OOD_IMAGES_CSV.exists():
+            raise FileNotFoundError(
+                f"REEXTRACT_PUBLIC_QUERIES=1 requires {config.ID_IMAGES_CSV} and "
+                f"{config.OOD_IMAGES_CSV}. Run public dataprep first."
+            )
+        copied = {}
+        copied.update(_extract_public_side("id", config.ID_IMAGES_CSV, models, tfs, device))
+        copied.update(_extract_public_side("ood", config.OOD_IMAGES_CSV, models, tfs, device))
+        public_source_note = "re-extracted from corrected public CSVs"
+    else:
+        src = np.load(config.SOURCE_EMB_CACHE_PATH, allow_pickle=False)
+        copied = {k: src[k] for k in src.files if cache_schema.is_copy_key(k)}
+        if not copied:
+            raise KeyError(f"No id/ood query keys found in {config.SOURCE_EMB_CACHE_PATH}.")
+        print(f"Copied {len(copied)} unchanged ID/OOD query keys from {config.SOURCE_EMB_CACHE_NAME}")
+        public_source_note = f"copied from {config.SOURCE_EMB_CACHE_NAME}"
 
     # ── Hygiene: public-OOD species must be disjoint from EVERY SWI split ────
     # (Otherwise a "novel" OOD species was actually a metric-training species.)
-    if "labels_ood_dinov2" in src.files:
-        ood_species = {canonical_label(x) for x in src["labels_ood_dinov2"]}
+    if "labels_ood_dinov2" in copied:
+        ood_species = {canonical_label(x) for x in copied["labels_ood_dinov2"]}
         for split in ("meta-train", "meta-val", "meta-test"):
             split_species = {canonical_label(it[1]) for it in manifest[split]}
             overlap = ood_species & split_species
@@ -220,6 +293,8 @@ def build(device=None, force=None):
     np.savez_compressed(config.FULL954_CACHE_PATH, **out)
     meta = cache_schema.build_meta(n_rows, n_species, list(copied.keys()),
                                    cache_schema.SWI_KEYS, config.SOURCE_EMB_CACHE_NAME)
+    meta["public_query_source"] = public_source_note
+    meta["public_queries_reextracted"] = bool(reextract_public)
     meta["ce_train_robustness"] = {
         "swi_in_ce_train_key": "swi_in_ce_train",
         "ce_train_images": int(swi_in_ce_train.sum()),
