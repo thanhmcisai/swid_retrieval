@@ -12,6 +12,7 @@ a cache miss is recorded as "Not found (offline)" instead of stalling a run.
 """
 
 import json
+import os
 import re
 import shutil
 import time
