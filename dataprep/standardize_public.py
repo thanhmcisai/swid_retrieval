@@ -13,6 +13,7 @@ a cache miss is recorded as "Not found (offline)" instead of stalling a run.
 
 import json
 import re
+import shutil
 import time
 import unicodedata
 from pathlib import Path
@@ -230,6 +231,45 @@ def _grouped(df_sub):
     }).sort_values("canonical_binomial")
 
 
+def _before_correction_path(path):
+    path = Path(path)
+    return path.with_name(path.stem + ".before_public_correction" + path.suffix)
+
+
+def _backup_existing(path):
+    path = Path(path)
+    backup = _before_correction_path(path)
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
+        print(f"  ↻ Backed up pre-correction file: {backup}")
+    return backup
+
+
+def _ensure_old_expanded_backup(species_backup, expanded_path):
+    """Create the pre-correction expanded CSV if only the species CSV exists.
+
+    This lets cache migration proceed on Colab even when the intermediate
+    OOD_images_expanded.csv was not saved/uploaded. The expanded backup is
+    generated from the pre-correction species CSV before the corrected expanded
+    CSV overwrites the active filename.
+    """
+    species_backup = Path(species_backup)
+    expanded_backup = _before_correction_path(expanded_path)
+    if expanded_backup.exists() or not species_backup.exists():
+        return expanded_backup
+    print(f"  ↻ Creating pre-correction expanded CSV from {species_backup.name}")
+    old_force = os.environ.get("FORCE_PUBLIC_EXPAND")
+    os.environ["FORCE_PUBLIC_EXPAND"] = "0"
+    try:
+        expand_public_csv(species_backup, expanded_backup)
+    finally:
+        if old_force is None:
+            os.environ.pop("FORCE_PUBLIC_EXPAND", None)
+        else:
+            os.environ["FORCE_PUBLIC_EXPAND"] = old_force
+    return expanded_backup
+
+
 def run():
     corrections, corrections_path = _load_public_label_corrections()
     fsdm41_overrides = _fsdm41_override_map(corrections)
@@ -241,6 +281,13 @@ def run():
     if D.ID_SPECIES_CSV.exists() and D.OOD_SPECIES_CSV.exists() and not D.FORCE_DATAPREP:
         print(f"✅ {D.ID_SPECIES_CSV.name} + {D.OOD_SPECIES_CSV.name} exist → skip standardize")
     else:
+        old_id_species = _backup_existing(D.ID_SPECIES_CSV)
+        old_ood_species = _backup_existing(D.OOD_SPECIES_CSV)
+        _backup_existing(D.ID_IMAGES_CSV)
+        _backup_existing(D.OOD_IMAGES_CSV)
+        _ensure_old_expanded_backup(old_id_species, D.ID_IMAGES_CSV)
+        _ensure_old_expanded_backup(old_ood_species, D.OOD_IMAGES_CSV)
+
         all_records = []
         for ds, cfg in dataset_configs.items():
             recs = scan_dataset(ds, cfg)
