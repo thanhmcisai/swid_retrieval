@@ -309,6 +309,20 @@ def _scurd_full_gallery(sc, emb, gallery_mask):
     return project_np(model, swi_dinov2[gallery_mask], device)
 
 
+def _project_scurd_current(arr, reason):
+    if not SCURD_MAIN_CKPT.exists():
+        raise KeyError(
+            f"SC-URD projected cache is stale for {reason}, and checkpoint is "
+            f"missing: {SCURD_MAIN_CKPT}."
+        )
+    import torch
+    from swid_retrieval.scurd import load_scurd_model, project_np
+    device = DEVICE if (DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
+    print(f"Projecting current SC-URD {reason} from {SCURD_MAIN_CKPT.name}")
+    model, _ = load_scurd_model(SCURD_MAIN_CKPT, in_dim=arr.shape[1], device=device)
+    return project_np(model, arr, device)
+
+
 def load_artifacts():
     print(f"ROOT_PATH={ROOT_PATH}")
     print(f"RESULTS_DIR={RESULTS_DIR}")
@@ -366,11 +380,18 @@ def load_artifacts():
     if SCURD_PROJ_CACHE.exists():
         print(f"Loading SC-URD projected cache: {SCURD_PROJ_CACHE}")
         sc = np.load(SCURD_PROJ_CACHE, allow_pickle=False)
-        sc_gal = _scurd_full_gallery(sc, emb, gallery_mask) if IS_FULL_GALLERY else sc["gal"]
+        sc_id = sc["id"] if "id" in sc.files and len(sc["id"]) == len(labels_id) else _project_scurd_current(emb["embs_id_dinov2"], "ID rows")
+        sc_ood = sc["ood"] if "ood" in sc.files and len(sc["ood"]) == len(labels_ood) else _project_scurd_current(emb["embs_ood_dinov2"], "OOD rows")
+        if IS_FULL_GALLERY:
+            sc_gal = _scurd_full_gallery(sc, emb, gallery_mask)
+        elif "gal" in sc.files and len(sc["gal"]) == int(gallery_mask.sum()):
+            sc_gal = sc["gal"]
+        else:
+            sc_gal = _project_scurd_current(emb["embs_swi_dinov2"][gallery_mask], "gallery rows")
         methods["SC-URD"] = {
-            "id": sc["id"],
+            "id": sc_id,
             "gal": sc_gal,
-            "ood": sc["ood"],
+            "ood": sc_ood,
             "gal_labels": gal_labels,
             "scurd": True,
         }

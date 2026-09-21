@@ -496,25 +496,43 @@ def load_embedding_artifacts():
     }
     if SCURD_PROJ_CACHE.exists():
         sc = np.load(SCURD_PROJ_CACHE, allow_pickle=False)
+        scurd_model = None
+        scurd_device = None
+
+        def _project_current(arr, reason):
+            nonlocal scurd_model, scurd_device
+            if not SCURD_MAIN_CKPT.exists():
+                raise KeyError(
+                    f"SC-URD projected cache is not aligned for {reason}, and "
+                    f"checkpoint is missing: {SCURD_MAIN_CKPT}"
+                )
+            if scurd_model is None:
+                try:
+                    import torch
+                    scurd_device = DEVICE if (DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
+                except Exception:
+                    scurd_device = "cpu"
+                print(f"SC-URD projected cache is stale for {reason}; projecting current embeddings from {SCURD_MAIN_CKPT.name}")
+                scurd_model, _ = load_scurd_model(SCURD_MAIN_CKPT, in_dim=arr.shape[1], device=scurd_device)
+            return project_np(scurd_model, arr, scurd_device)
+
+        if "id" in sc.files and len(sc["id"]) == len(labels_id):
+            sc_id = sc["id"]
+        else:
+            sc_id = _project_current(emb["embs_id_dinov2"], "public ID rows")
+
+        if "ood" in sc.files and len(sc["ood"]) == len(labels_ood):
+            sc_ood = sc["ood"]
+        else:
+            sc_ood = _project_current(emb["embs_ood_dinov2"], "public OOD rows")
+
         if uses_full_rows:
             # Get the SC-URD projection over the FULL 954-row pool, then apply the
             # same gallery_mask (all-ones for full_swi, CE-train mask for ce_train).
             if "swi_pool" in sc.files and len(sc["swi_pool"]) == len(labels_swi):
                 full_pool = sc["swi_pool"]
             else:
-                if not SCURD_MAIN_CKPT.exists():
-                    raise KeyError(
-                        f"{SCURD_PROJ_CACHE} does not contain an aligned 'swi_pool' and "
-                        f"SC-URD checkpoint is missing: {SCURD_MAIN_CKPT}"
-                    )
-                try:
-                    import torch
-                    device = DEVICE if (DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
-                except Exception:
-                    device = "cpu"
-                print(f"SC-URD projected cache lacks aligned swi_pool; projecting full SWI from {SCURD_MAIN_CKPT.name}")
-                model, _ = load_scurd_model(SCURD_MAIN_CKPT, in_dim=emb["embs_swi_dinov2"].shape[1], device=device)
-                full_pool = project_np(model, emb["embs_swi_dinov2"], device)
+                full_pool = _project_current(emb["embs_swi_dinov2"], "full SWI gallery")
             if len(full_pool) != len(labels_swi):
                 raise ValueError(
                     f"SC-URD swi_pool length={len(full_pool)} but labels_swi length={len(labels_swi)}. "
@@ -523,12 +541,15 @@ def load_embedding_artifacts():
             sc_gal = full_pool[gallery_mask]
             sc_gal_labels = labels_swi[gallery_mask]
         else:
-            sc_gal = sc["gal"]
+            if "gal" in sc.files and len(sc["gal"]) == int(gallery_mask.sum()):
+                sc_gal = sc["gal"]
+            else:
+                sc_gal = _project_current(emb["embs_swi_dinov2"][gallery_mask], "selected gallery rows")
             sc_gal_labels = gal_labels
         methods["SC-URD"] = {
-            "id": sc["id"],
+            "id": sc_id,
             "gal": sc_gal,
-            "ood": sc["ood"],
+            "ood": sc_ood,
             "gal_labels": sc_gal_labels,
             "kind": "scurd",
         }
