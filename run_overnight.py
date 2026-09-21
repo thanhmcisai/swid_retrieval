@@ -25,6 +25,14 @@ _DEFAULTS = {
     # Protocol: full 954-species SWI gallery (cardinality-matched to CE).
     "GALLERY_SCOPE": "full_swi",
     "MIN_FULL_GALLERY_SPECIES": "900",
+    "FULL954_CACHE_NAME": "embedding_cache_full954_v4_corrected_public.npz",
+    "SOURCE_FULL954_CACHE_NAME": "embedding_cache_full954_v3.npz",
+    "RUN_PUBLIC_DATAPREP": "1",
+    "RUN_PUBLIC_CACHE_MIGRATION": "1",
+    "FORCE_DATAPREP": "1",
+    "FORCE_PUBLIC_EXPAND": "1",
+    "EXCLUDE_WOODAUTH": "1",
+    "APPLY_FSDM41_CORRECTION": "1",
     # Step 0: build cache + parallel image pre-warm (Drive is slow per-file).
     "RUN_BUILD_FULL954": "1",
     "FORCE_REBUILD_FULL954": "0",   # 0 -> skip if a valid 954 cache already exists

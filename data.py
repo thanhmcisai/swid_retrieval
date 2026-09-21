@@ -347,23 +347,43 @@ def ce_train_image_paths(manifest, seed=42, train_frac=0.65):
 
 
 def expand_public_csv(csv_path, cache_path, datasets_dir=None):
-    """Parse folder_path list-strings → per-image CSV (file_path, label)."""
+    """Parse folder_path list-strings → per-image CSV.
+
+    The expanded CSV row order is the row order used by the public embedding
+    arrays. When public labels are corrected, keep a one-time backup of the old
+    expanded CSV so the corrected cache can migrate features by file_path instead
+    of re-extracting images.
+    """
     cache = Path(cache_path)
-    if cache.exists():
+    force_expand = os.environ.get("FORCE_PUBLIC_EXPAND", "0") == "1"
+    if cache.exists() and not force_expand:
         df = pd.read_csv(cache)
         print(f"✅ Cached: {cache} ({len(df)} images)")
         return df
+    if cache.exists() and force_expand:
+        backup = cache.with_name(cache.stem + ".before_public_correction.csv")
+        if not backup.exists():
+            cache.replace(backup)
+            print(f"↻ Backed up previous expanded CSV: {backup}")
     df = pd.read_csv(csv_path)
     rows = []
     for _, row in df.iterrows():
-        for folder in ast.literal_eval(row["folder_path"]):
+        folders = ast.literal_eval(row["folder_path"])
+        datasets = ast.literal_eval(row["dataset"]) if "dataset" in row and isinstance(row["dataset"], str) else []
+        originals = ast.literal_eval(row["original_name"]) if "original_name" in row and isinstance(row["original_name"], str) else []
+        for j, folder in enumerate(folders):
             folder = folder.replace(LOCAL_PREFIX, DRIVE_PREFIX)
             p = Path(folder)
             if not p.exists():
                 continue
             for img in p.iterdir():
                 if img.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                    rows.append({"file_path": str(img), "label": row["canonical_binomial"]})
+                    rows.append({
+                        "file_path": str(img),
+                        "label": row["canonical_binomial"],
+                        "source_dataset": datasets[j] if j < len(datasets) else "",
+                        "source_original_name": originals[j] if j < len(originals) else "",
+                    })
     result = pd.DataFrame(rows)
     result.to_csv(cache, index=False)
     print(f"✅ Expanded: {len(result)} images → {cache}")

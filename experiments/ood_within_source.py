@@ -54,7 +54,13 @@ def _load_public_meta(labels_id, labels_ood):
         df["cache_block"] = kind
         df["cache_index"] = np.arange(len(df), dtype=int)
         df["label"] = [canonical_label(x) for x in labels]
-        df["source_dataset"] = df["file_path"].map(_infer_source)
+        if "source_dataset" in df.columns:
+            df["source_dataset"] = df["source_dataset"].fillna("").astype(str)
+            missing = df["source_dataset"].str.len().eq(0)
+            if missing.any():
+                df.loc[missing, "source_dataset"] = df.loc[missing, "file_path"].map(_infer_source)
+        else:
+            df["source_dataset"] = df["file_path"].map(_infer_source)
         frames.append(df[["file_path", "label", "source_dataset", "cache_block", "cache_index"]])
     return pd.concat(frames, ignore_index=True)
 

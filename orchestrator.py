@@ -311,8 +311,29 @@ def main():
     print(f"ROOT_PATH={config.ROOT_PATH}\nRUN_ROOT={run_root}\nFULL954_CACHE={config.FULL954_CACHE_PATH}")
 
     config.configure_runtime(verbose=True)
-    from .data import prepare_public_csvs
-    prepare_public_csvs(config.ROOT_PATH)
+    ran_public_dataprep = False
+    if config.RUN_PUBLIC_DATAPREP:
+        print("\n[public] Rebuilding corrected public ID/OOD CSVs...")
+        from .dataprep import standardize_public
+        standardize_public.run()
+        ran_public_dataprep = True
+    else:
+        print("\n[public] RUN_PUBLIC_DATAPREP=0; reusing existing public ID/OOD CSVs.")
+
+    if not ran_public_dataprep:
+        from .data import prepare_public_csvs
+        prepare_public_csvs(config.ROOT_PATH)
+
+    if config.RUN_PUBLIC_CACHE_MIGRATION:
+        print("\n[public] Migrating public ID/OOD rows in full-954 cache...")
+        from .embeddings import migrate_public_cache
+        migrate_public_cache.run()
+        if config.PUBLIC_LABEL_AUDIT_CSV.exists():
+            shutil.copy2(config.PUBLIC_LABEL_AUDIT_CSV, run_root / config.PUBLIC_LABEL_AUDIT_CSV.name)
+            manifest["public_label_correction_audit"] = str(run_root / config.PUBLIC_LABEL_AUDIT_CSV.name)
+    else:
+        print("\n[public] RUN_PUBLIC_CACHE_MIGRATION=0; assuming full-954 cache already matches public CSVs.")
+
     _preload_images_if_requested()
 
     # Step 0 — build the full-954 gallery cache (the only heavy extraction).

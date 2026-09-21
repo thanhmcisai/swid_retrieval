@@ -1,5 +1,22 @@
 # Revision Changelog
 
+## DATAFIX — FSDM41 relabelling and WoodAuth exclusion
+
+- Added public-dataset correction support for `dataset_label_corrections.json`:
+  FSDM41 folder names are relabelled before canonicalization, while WoodAuth is
+  excluded by default because its public release mixes transverse and
+  longitudinal sections without released per-image section-plane labels.
+- Added corrected-public cache migration:
+  `embedding_cache_full954_v4_corrected_public.npz` is created from the prior
+  full-954 cache by matching public rows on `file_path`, dropping excluded
+  WoodAuth rows, and replacing labels from corrected expanded CSVs. SWI gallery
+  features are copied unchanged; no image feature extraction is required for
+  the data-label fix.
+- Added `public_label_correction_audit.csv` output and copied it into each run
+  root for export/review.
+- No manuscript numbers were changed by this code edit. OOD-dependent
+  experiments must be rerun before updating tables and prose.
+
 ## REV-1 / REV-6 partial — SC-URD training and equation fidelity
 
 - Updated SC-URD training metadata for newly produced seed checkpoints:

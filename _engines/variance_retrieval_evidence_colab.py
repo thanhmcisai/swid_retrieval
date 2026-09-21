@@ -996,8 +996,9 @@ def source_from_path(path):
         ("goimai", "GOIMAI"),
         ("pca11", "PCA11"),
         ("vn26", "VN26"),
-        ("wood-auth", "WOOD-AUTH"),
-        ("wood_auth", "WOOD-AUTH"),
+        ("wood-auth", "WOODAUTH"),
+        ("wood_auth", "WOODAUTH"),
+        ("woodauth", "WOODAUTH"),
         ("wrd25", "WRD25"),
     ]
     for needle, label in known:

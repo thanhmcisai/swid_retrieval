@@ -15,6 +15,7 @@ import json
 import re
 import time
 import unicodedata
+from pathlib import Path
 
 import pandas as pd
 
@@ -41,6 +42,33 @@ SPELLING_CORRECTIONS = {
     "cinnamomum czmphora": "cinnamomum camphora",
 }
 LOCAL_TO_SCIENTIFIC = {"nogal cafetero": "cordia alliodora", "cedro costeno": "cedrela odorata"}
+
+
+def _correction_path():
+    candidates = [
+        D.C.ROOT_PATH / "dataset_label_corrections.json",
+        Path(__file__).resolve().parents[2] / "dataset_label_corrections.json",
+        Path.cwd() / "dataset_label_corrections.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
+
+def _load_public_label_corrections():
+    path = _correction_path()
+    if not path.exists():
+        print(f"  ⚠️ public label correction file not found: {path}")
+        return {}, path
+    payload = json.load(open(path, encoding="utf-8"))
+    return payload, path
+
+
+def _fsdm41_override_map(payload):
+    if not D.APPLY_FSDM41_CORRECTION:
+        return {}
+    return (payload.get("FSDM41", {}) or {}).get("overrides", {}) or {}
 
 
 # ── 5-stage name standardization ─────────────────────────────────────────────
@@ -203,16 +231,30 @@ def _grouped(df_sub):
 
 
 def run():
+    corrections, corrections_path = _load_public_label_corrections()
+    fsdm41_overrides = _fsdm41_override_map(corrections)
+    dataset_configs = dict(DATASET_CONFIGS)
+    if D.EXCLUDE_WOODAUTH and "WOODAUTH" in dataset_configs:
+        dataset_configs.pop("WOODAUTH")
+        print("  WOODAUTH: excluded by public-label correction policy")
+
     if D.ID_SPECIES_CSV.exists() and D.OOD_SPECIES_CSV.exists() and not D.FORCE_DATAPREP:
         print(f"✅ {D.ID_SPECIES_CSV.name} + {D.OOD_SPECIES_CSV.name} exist → skip standardize")
     else:
         all_records = []
-        for ds, cfg in DATASET_CONFIGS.items():
+        for ds, cfg in dataset_configs.items():
             recs = scan_dataset(ds, cfg)
             all_records.extend(recs)
             print(f"  {ds}: {len(recs)} folders")
         for rec in all_records:
-            q, v, std = preprocess_name(rec["original_name"], rec["dataset"])
+            label_name = rec["original_name"]
+            rec["label_correction"] = ""
+            rec["corrected_name"] = ""
+            if rec["dataset"] == "FSDM41" and label_name in fsdm41_overrides:
+                rec["label_correction"] = "FSDM41_PERMUTED_LABEL"
+                rec["corrected_name"] = fsdm41_overrides[label_name]
+                label_name = rec["corrected_name"]
+            q, v, std = preprocess_name(label_name, rec["dataset"])
             rec.update(query_name=q, variant=v, standardized_name=std)
 
         cache = load_gbif_cache()
@@ -241,7 +283,8 @@ def run():
 
         cols = ["dataset", "original_name", "standardized_name", "query_name", "variant",
                 "canonical_binomial", "gbif_status", "gbif_matched_name", "gbif_accepted_name",
-                "folder_path", "image_count", "magnification", "distribution"]
+                "folder_path", "image_count", "magnification", "distribution",
+                "label_correction", "corrected_name"]
         df_all = pd.DataFrame(all_records)[cols].sort_values(["dataset", "canonical_binomial"])
         D.PUBLIC_STD_CSV.parent.mkdir(parents=True, exist_ok=True)
         df_all.to_csv(D.PUBLIC_STD_CSV, index=False)
@@ -252,6 +295,33 @@ def run():
         if not df_ood.empty:
             _grouped(df_ood).to_csv(D.OOD_SPECIES_CSV, index=False)
         print(f"  ✅ {df_id['canonical_binomial'].nunique()} ID / {df_ood['canonical_binomial'].nunique()} OOD species")
+
+        audit_rows = []
+        fsdm = df_all[df_all["dataset"].eq("FSDM41")]
+        audit_rows.append({
+            "item": "FSDM41",
+            "status": "corrected" if fsdm41_overrides else "not_corrected",
+            "correction_file": str(corrections_path),
+            "folders": int(len(fsdm)),
+            "images": int(fsdm["image_count"].sum()) if not fsdm.empty else 0,
+            "corrected_folders": int((fsdm["label_correction"] == "FSDM41_PERMUTED_LABEL").sum()) if not fsdm.empty else 0,
+            "corrected_images": int(fsdm.loc[fsdm["label_correction"] == "FSDM41_PERMUTED_LABEL", "image_count"].sum()) if not fsdm.empty else 0,
+            "note": "Folder paths unchanged; species labels corrected before canonicalization.",
+        })
+        if D.EXCLUDE_WOODAUTH:
+            wa = (corrections.get("WOODAUTH", {}) or {})
+            audit_rows.append({
+                "item": "WOODAUTH",
+                "status": "excluded",
+                "correction_file": str(corrections_path),
+                "folders": int(wa.get("n_species", 0) or 0),
+                "images": int(wa.get("n_images_excluded", 0) or 0),
+                "corrected_folders": 0,
+                "corrected_images": 0,
+                "note": "Excluded because public release mixes transverse and longitudinal sections without per-image plane labels.",
+            })
+        pd.DataFrame(audit_rows).to_csv(D.C.PUBLIC_LABEL_AUDIT_CSV, index=False)
+        print(f"  ✅ Public label audit saved: {D.C.PUBLIC_LABEL_AUDIT_CSV}")
 
     # Per-image expansion (reuse the eval package's parser).
     if D.ID_SPECIES_CSV.exists():

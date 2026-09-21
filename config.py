@@ -29,15 +29,24 @@ ID_SPECIES_CSV = ROOT_PATH / "ID_species_public.csv"
 OOD_SPECIES_CSV = ROOT_PATH / "OOD_species_public.csv"
 ID_IMAGES_CSV = ROOT_PATH / "ID_images_expanded.csv"
 OOD_IMAGES_CSV = ROOT_PATH / "OOD_images_expanded.csv"
+PUBLIC_LABEL_CORRECTIONS_JSON = Path(os.environ.get(
+    "PUBLIC_LABEL_CORRECTIONS_JSON",
+    ROOT_PATH / "dataset_label_corrections.json"))
+PUBLIC_LABEL_AUDIT_CSV = ROOT_PATH / os.environ.get(
+    "PUBLIC_LABEL_AUDIT_NAME", "public_label_correction_audit.csv")
 
 # ── Embedding caches ─────────────────────────────────────────────────────
 # Old (meta-test only, ~317 species). Source of the unchanged ID/OOD query side.
 SOURCE_EMB_CACHE_NAME = os.environ.get("SOURCE_EMB_CACHE_NAME", "embedding_cache_v3.npz")
 SOURCE_EMB_CACHE_PATH = ROOT_PATH / SOURCE_EMB_CACHE_NAME
 # New (full 954-species SWI gallery). What downstream eval must read.
-FULL954_CACHE_NAME = os.environ.get("FULL954_CACHE_NAME", "embedding_cache_full954_v3.npz")
+# Corrected-public cache: same SWI gallery/features as v3, but public ID/OOD rows
+# are migrated after FSDM41 relabelling and WoodAuth exclusion.
+FULL954_CACHE_NAME = os.environ.get("FULL954_CACHE_NAME", "embedding_cache_full954_v4_corrected_public.npz")
 FULL954_CACHE_PATH = ROOT_PATH / FULL954_CACHE_NAME
 FULL954_META_PATH = ROOT_PATH / (FULL954_CACHE_NAME.replace(".npz", "_meta.json"))
+SOURCE_FULL954_CACHE_NAME = os.environ.get("SOURCE_FULL954_CACHE_NAME", "embedding_cache_full954_v3.npz")
+SOURCE_FULL954_CACHE_PATH = ROOT_PATH / SOURCE_FULL954_CACHE_NAME
 
 EXP4_CACHE_NAME = os.environ.get("EXP4_CACHE_NAME", "exp4_embedding_cache_v3.npz")  # VN26 — must NOT be the 954 cache
 
@@ -88,6 +97,9 @@ SCURD_Q_QUERY = int(os.environ.get("SCURD_Q_QUERY", "4"))
 
 # ── Build / run flags ────────────────────────────────────────────────────
 RUN_BUILD_FULL954 = os.environ.get("RUN_BUILD_FULL954", "1") == "1"
+RUN_PUBLIC_DATAPREP = os.environ.get("RUN_PUBLIC_DATAPREP", "1") == "1"
+RUN_PUBLIC_CACHE_MIGRATION = os.environ.get("RUN_PUBLIC_CACHE_MIGRATION", "1") == "1"
+FORCE_PUBLIC_CACHE_MIGRATION = os.environ.get("FORCE_PUBLIC_CACHE_MIGRATION", "0") == "1"
 FORCE_REBUILD_FULL954 = os.environ.get("FORCE_REBUILD_FULL954", "0") == "1"
 SAVE_PARTIAL = os.environ.get("SAVE_PARTIAL", "1") == "1"
 RUN_REVIEW_TAXONOMY_FULL_GALLERY = os.environ.get("RUN_REVIEW_TAXONOMY_FULL_GALLERY", "1") == "1"

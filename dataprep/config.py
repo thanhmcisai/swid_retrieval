@@ -55,6 +55,9 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 # ── Flags ────────────────────────────────────────────────────────────────────
 GBIF_OFFLINE = os.environ.get("GBIF_OFFLINE", "1") == "1"   # default: cache-only, no network
 FORCE_DATAPREP = os.environ.get("FORCE_DATAPREP", "0") == "1"
+FORCE_PUBLIC_EXPAND = os.environ.get("FORCE_PUBLIC_EXPAND", "0") == "1"
+EXCLUDE_WOODAUTH = os.environ.get("EXCLUDE_WOODAUTH", "1") == "1"
+APPLY_FSDM41_CORRECTION = os.environ.get("APPLY_FSDM41_CORRECTION", "1") == "1"
 RUN_DATAPREP_CROP = os.environ.get("RUN_DATAPREP_CROP", "1") == "1"
 RUN_DATAPREP_SELECT = os.environ.get("RUN_DATAPREP_SELECT", "1") == "1"
 RUN_DATAPREP_SPLIT = os.environ.get("RUN_DATAPREP_SPLIT", "1") == "1"
