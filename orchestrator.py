@@ -313,7 +313,7 @@ def main():
     config.configure_runtime(verbose=True)
     ran_public_dataprep = False
     if config.RUN_PUBLIC_DATAPREP:
-        print("\n[public] Rebuilding corrected public ID/OOD CSVs...")
+        print("\n[public] Preparing corrected public ID/OOD CSVs...")
         from .dataprep import standardize_public
         standardize_public.run()
         ran_public_dataprep = True

@@ -271,9 +271,188 @@ def _ensure_old_expanded_backup(species_backup, expanded_path):
     return expanded_backup
 
 
+def _canonical_from_corrected_label(label_name, dataset):
+    q, _, _ = preprocess_name(label_name, dataset)
+    return q.strip().lower()
+
+
+def _is_woodauth_row(row):
+    src = str(row.get("source_dataset", "")).upper()
+    path = str(row.get("file_path", "")).replace("\\", "/").upper()
+    return src == "WOODAUTH" or "/WOODAUTH/" in path
+
+
+def _is_fsdm41_row(row):
+    src = str(row.get("source_dataset", "")).upper()
+    path = str(row.get("file_path", "")).replace("\\", "/").upper()
+    return src == "FSDM41" or "/FSDM41/" in path
+
+
+def _correct_expanded_public_df(df, fsdm41_overrides):
+    df = df.copy()
+    if "source_dataset" not in df.columns:
+        df["source_dataset"] = ""
+    if "source_original_name" not in df.columns:
+        df["source_original_name"] = ""
+    df["label_correction"] = ""
+    df["corrected_name"] = ""
+
+    keep = []
+    for idx, row in df.iterrows():
+        if D.EXCLUDE_WOODAUTH and _is_woodauth_row(row):
+            keep.append(False)
+            df.at[idx, "label_correction"] = "WOODAUTH_EXCLUDED"
+            continue
+        keep.append(True)
+        if _is_fsdm41_row(row):
+            original = str(row.get("source_original_name", ""))
+            corrected = fsdm41_overrides.get(original)
+            if corrected:
+                df.at[idx, "label"] = _canonical_from_corrected_label(corrected, "FSDM41")
+                df.at[idx, "label_correction"] = "FSDM41_PERMUTED_LABEL"
+                df.at[idx, "corrected_name"] = corrected
+    return df.loc[keep].reset_index(drop=True), df.loc[[not x for x in keep]].reset_index(drop=True)
+
+
+def _infer_magnification_from_path(path):
+    parts = [p.lower() for p in Path(str(path)).parts]
+    for mag in ("x10", "x20", "x50"):
+        if mag in parts:
+            return mag
+    return ""
+
+
+def _species_csv_from_expanded(df, out_path):
+    rows = []
+    for label, g in df.groupby("label", sort=True):
+        folder_paths = sorted({str(Path(p).parent) for p in g["file_path"].astype(str)})
+        datasets = []
+        originals = []
+        magnifications = []
+        image_count = 0
+        for folder in folder_paths:
+            sub = g[g["file_path"].astype(str).map(lambda p, f=folder: str(Path(p).parent) == f)]
+            first = sub.iloc[0]
+            datasets.append(str(first.get("source_dataset", "")))
+            originals.append(str(first.get("source_original_name", "")))
+            magnifications.append(_infer_magnification_from_path(folder))
+            image_count += int(len(sub))
+        rows.append({
+            "canonical_binomial": label,
+            "dataset": datasets,
+            "original_name": originals,
+            "folder_path": folder_paths,
+            "image_count": image_count,
+            "magnification": magnifications,
+            "gbif_status": "v3_artifact",
+            "gbif_accepted_name": "",
+        })
+    out = pd.DataFrame(rows).sort_values("canonical_binomial")
+    out.to_csv(out_path, index=False)
+    return out
+
+
+def _run_v3_artifact_correction(corrections, corrections_path, fsdm41_overrides):
+    """Correct public CSVs by migrating the audited v3 public artifacts.
+
+    The original v3 pipeline already fixed the ID/OOD split using GBIF and the
+    SmartWoodID reference list. For the public-label correction, do not rerun
+    that taxonomy pipeline. Instead, preserve the v3 ID/OOD assignment, remove
+    WoodAuth rows, and relabel FSDM41 rows by file path/source folder.
+    """
+    if not D.ID_SPECIES_CSV.exists() or not D.OOD_SPECIES_CSV.exists():
+        raise FileNotFoundError(
+            "v3 artifact correction requires ID_species_public.csv and "
+            "OOD_species_public.csv under ROOT_PATH."
+        )
+    old_id_species = _backup_existing(D.ID_SPECIES_CSV)
+    old_ood_species = _backup_existing(D.OOD_SPECIES_CSV)
+    _backup_existing(D.ID_IMAGES_CSV)
+    _backup_existing(D.OOD_IMAGES_CSV)
+    old_id_expanded = _ensure_old_expanded_backup(old_id_species, D.ID_IMAGES_CSV)
+    old_ood_expanded = _ensure_old_expanded_backup(old_ood_species, D.OOD_IMAGES_CSV)
+
+    id_old = pd.read_csv(old_id_expanded)
+    ood_old = pd.read_csv(old_ood_expanded)
+    id_new, id_dropped = _correct_expanded_public_df(id_old, fsdm41_overrides)
+    ood_new, ood_dropped = _correct_expanded_public_df(ood_old, fsdm41_overrides)
+
+    print(
+        "  v3 artifact source: "
+        f"ID={len(id_old)} images/{id_old['label'].nunique()} species, "
+        f"OOD={len(ood_old)} images/{ood_old['label'].nunique()} species"
+    )
+    print(
+        "  corrections applied: "
+        f"FSDM41 relabelled={(id_new['label_correction'].eq('FSDM41_PERMUTED_LABEL').sum() + ood_new['label_correction'].eq('FSDM41_PERMUTED_LABEL').sum())} images, "
+        f"WoodAuth dropped={len(id_dropped) + len(ood_dropped)} images"
+    )
+
+    if id_new["label"].nunique() < 20:
+        raise RuntimeError(
+            f"Corrected ID split has only {id_new['label'].nunique()} species; "
+            "refusing to overwrite v3 artifacts."
+        )
+    if len(ood_new) >= len(ood_old) and D.EXCLUDE_WOODAUTH:
+        raise RuntimeError(
+            "WoodAuth exclusion was requested but no OOD rows were dropped; "
+            "check that v3 expanded CSVs include source_dataset/source paths."
+        )
+    overlap = set(id_new["label"].astype(str)) & set(ood_new["label"].astype(str))
+    if overlap:
+        raise RuntimeError(f"Corrected ID/OOD overlap: {sorted(overlap)[:10]}")
+
+    id_new.to_csv(D.ID_IMAGES_CSV, index=False)
+    ood_new.to_csv(D.OOD_IMAGES_CSV, index=False)
+    id_species = _species_csv_from_expanded(id_new, D.ID_SPECIES_CSV)
+    ood_species = _species_csv_from_expanded(ood_new, D.OOD_SPECIES_CSV)
+
+    audit_rows = []
+    for side, old_df, new_df, dropped_df in [
+        ("ID", id_old, id_new, id_dropped),
+        ("OOD", ood_old, ood_new, ood_dropped),
+    ]:
+        fsdm_mask = new_df.get("label_correction", pd.Series([], dtype=str)).eq("FSDM41_PERMUTED_LABEL")
+        audit_rows.append({
+            "item": f"{side}_v3_artifact_migration",
+            "status": "corrected",
+            "correction_file": str(corrections_path),
+            "old_images": int(len(old_df)),
+            "new_images": int(len(new_df)),
+            "old_species": int(old_df["label"].nunique()),
+            "new_species": int(new_df["label"].nunique()),
+            "dropped_images": int(len(dropped_df)),
+            "corrected_images": int(fsdm_mask.sum()),
+            "note": "Preserved v3 ID/OOD split; corrected FSDM41 labels and removed WoodAuth rows only.",
+        })
+    if D.EXCLUDE_WOODAUTH:
+        wa = (corrections.get("WOODAUTH", {}) or {})
+        audit_rows.append({
+            "item": "WOODAUTH",
+            "status": "excluded",
+            "correction_file": str(corrections_path),
+            "old_images": int(len(id_dropped) + len(ood_dropped)),
+            "new_images": 0,
+            "old_species": int(wa.get("n_species", 0) or 0),
+            "new_species": 0,
+            "dropped_images": int(len(id_dropped) + len(ood_dropped)),
+            "corrected_images": 0,
+            "note": "Excluded because public release mixes transverse and longitudinal sections without per-image plane labels.",
+        })
+    pd.DataFrame(audit_rows).to_csv(D.C.PUBLIC_LABEL_AUDIT_CSV, index=False)
+    print(f"  ✅ v3 artifact correction: {len(id_species)} ID / {len(ood_species)} OOD species")
+    print(f"  ✅ Expanded corrected public CSVs: ID={len(id_new)} images, OOD={len(ood_new)} images")
+    print(f"  ✅ Public label audit saved: {D.C.PUBLIC_LABEL_AUDIT_CSV}")
+    return True
+
+
 def run():
     corrections, corrections_path = _load_public_label_corrections()
     fsdm41_overrides = _fsdm41_override_map(corrections)
+    if D.EXCLUDE_WOODAUTH or fsdm41_overrides:
+        _run_v3_artifact_correction(corrections, corrections_path, fsdm41_overrides)
+        return
+
     dataset_configs = dict(DATASET_CONFIGS)
     if D.EXCLUDE_WOODAUTH and "WOODAUTH" in dataset_configs:
         dataset_configs.pop("WOODAUTH")
