@@ -322,9 +322,21 @@ def run():
             rec["gbif_accepted_name"] = g.get("accepted_name")
             rec["canonical_binomial"] = extract_canonical_binomial(g.get("canonical_full"), query_name=q)
 
-        swid = pd.read_csv(D.SWID_GBIF_CSV)
-        swid_canon = {extract_canonical_binomial(c) for c in swid["canonical"].dropna().unique()}
-        print(f"  SmartWoodID reference species: {len(swid_canon)}")
+        if D.SWID_GBIF_CSV.exists():
+            swid = pd.read_csv(D.SWID_GBIF_CSV)
+            swid_canon = {extract_canonical_binomial(c) for c in swid["canonical"].dropna().unique()}
+            swid_source = str(D.SWID_GBIF_CSV)
+        else:
+            id_backup = _before_correction_path(D.ID_SPECIES_CSV)
+            if not id_backup.exists():
+                raise FileNotFoundError(
+                    f"Missing {D.SWID_GBIF_CSV} and fallback {id_backup}; cannot determine public ID species."
+                )
+            id_prev = pd.read_csv(id_backup)
+            swid_canon = set(id_prev["canonical_binomial"].dropna().astype(str).str.lower())
+            swid_source = str(id_backup)
+            print(f"  ⚠️  {D.SWID_GBIF_CSV.name} missing; using prior ID species CSV as ID/OOD reference")
+        print(f"  SmartWoodID reference species: {len(swid_canon)} ({swid_source})")
         for rec in all_records:
             cb = rec["canonical_binomial"]
             rec["distribution"] = "ID" if cb and cb in swid_canon else "OOD"
