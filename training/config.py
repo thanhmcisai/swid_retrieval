@@ -89,4 +89,12 @@ def base_cfg():
     c = Config()
     if FAST:
         c.epochs = 2
+    if os.environ.get("TRAIN_EPOCHS"):
+        c.epochs = int(os.environ["TRAIN_EPOCHS"])
+    if os.environ.get("CE_BATCH_SIZE"):
+        c.batch_size_ce = int(os.environ["CE_BATCH_SIZE"])
+    if os.environ.get("VAL_BATCH_SIZE"):
+        c.batch_size_val = int(os.environ["VAL_BATCH_SIZE"])
+    if os.environ.get("TRAIN_NUM_WORKERS"):
+        c.num_workers = int(os.environ["TRAIN_NUM_WORKERS"])
     return c

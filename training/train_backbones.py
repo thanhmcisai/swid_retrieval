@@ -40,11 +40,21 @@ def _build_embedding_model(backbone, embedding_dim, pretrained, device):
 
 
 def _is_complete(ckpt, total_epochs):
-    """Replicates the monolith short-circuit: complete, past total, or legacy (no flag)."""
+    """Return whether a checkpoint represents a finished training run.
+
+    Older validated checkpoints did not carry ``training_complete`` and should
+    still short-circuit. New in-progress checkpoints do carry ``total_epochs``;
+    those must resume instead of being mistaken for legacy complete weights.
+    """
     mets = ckpt.get("metrics", {})
-    return (mets.get("training_complete", False)
-            or ckpt.get("epoch", 0) >= total_epochs
-            or "training_complete" not in mets)
+    epoch = ckpt.get("epoch", 0)
+    if mets.get("training_complete", False):
+        return True
+    if epoch >= total_epochs:
+        return True
+    if "training_complete" not in mets and "total_epochs" not in mets:
+        return True
+    return False
 
 
 def _stamp_complete(ckpt_path, total_epochs, best_epoch):
