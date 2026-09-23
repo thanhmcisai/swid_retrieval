@@ -99,6 +99,7 @@ SCURD_Q_QUERY = int(os.environ.get("SCURD_Q_QUERY", "4"))
 RUN_BUILD_FULL954 = os.environ.get("RUN_BUILD_FULL954", "1") == "1"
 RUN_PUBLIC_DATAPREP = os.environ.get("RUN_PUBLIC_DATAPREP", "1") == "1"
 RUN_PUBLIC_CACHE_MIGRATION = os.environ.get("RUN_PUBLIC_CACHE_MIGRATION", "1") == "1"
+RUN_CE_CACHE_UPDATE = os.environ.get("RUN_CE_CACHE_UPDATE", "0") == "1"
 FORCE_PUBLIC_CACHE_MIGRATION = os.environ.get("FORCE_PUBLIC_CACHE_MIGRATION", "0") == "1"
 FORCE_REBUILD_FULL954 = os.environ.get("FORCE_REBUILD_FULL954", "0") == "1"
 SAVE_PARTIAL = os.environ.get("SAVE_PARTIAL", "1") == "1"

@@ -336,6 +336,11 @@ def main():
 
     _preload_images_if_requested()
 
+    if config.RUN_CE_CACHE_UPDATE:
+        print("\n[cache] Updating CE-Full embeddings/logits from existing corrected full-954 cache...")
+        from .embeddings import update_ce_cache
+        update_ce_cache.run()
+
     # Step 0 — build the full-954 gallery cache (the only heavy extraction).
     if _skip("BUILD_FULL954_CACHE") or not config.RUN_BUILD_FULL954:
         print("\n[0/9] SKIP_BUILD_FULL954_CACHE=1 or RUN_BUILD_FULL954=0; assuming full-954 cache already exists.")
