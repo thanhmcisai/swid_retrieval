@@ -15,6 +15,9 @@ Usage on Colab (after mounting Drive; swid_retrieval/ lives under ROOT_PATH):
 
 Re-run after a disconnect: the cache build skips (idempotent), trained SC-URD
 seeds skip, and FULL954_RUN_STAMP is fixed so outputs resume in the same folder.
+
+Set RUN_FINAL_COLAB_AUDIT=1 before invoking this module to run only the
+inference-only final audit. Full-pipeline flags are ignored in that mode.
 """
 
 import os
@@ -103,7 +106,30 @@ if __name__ == "__main__":
     import torch
     print(f"CUDA: {torch.cuda.is_available()} "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    print(f"ROOT_PATH={os.environ['ROOT_PATH']}  GALLERY_SCOPE={os.environ['GALLERY_SCOPE']}")
-    from swid_retrieval import orchestrator
-    run_dir = orchestrator.main()
-    print(f"\n===== DONE. Results: {run_dir} =====")
+    if os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
+        from argparse import Namespace
+        from pathlib import Path
+        from swid_retrieval import final_colab_audit
+
+        root = Path(os.environ["ROOT_PATH"])
+        run_root = Path(os.environ.get(
+            "FINAL_AUDIT_RUN_ROOT",
+            root / "results" / "paper_reframe_full954_retrained_ce_corrected_public"))
+        out = Path(os.environ.get("FINAL_AUDIT_OUT", run_root / "final_colab_audit"))
+        args = Namespace(
+            root=root, run_root=run_root, out=out,
+            research_dir=None, cache=None, exp4=None, ce_checkpoint=None,
+            device=os.environ.get("DEVICE", "cuda"),
+            batch_size=int(os.environ.get("FINAL_AUDIT_BATCH_SIZE", "64")),
+            workers=int(os.environ.get("FINAL_AUDIT_WORKERS", "4")),
+            gallery_repeats=int(os.environ.get("FINAL_AUDIT_GALLERY_REPEATS", "100")),
+            ood_kshot_repeats=int(os.environ.get("FINAL_AUDIT_OOD_KSHOT_REPEATS", "50")),
+            preflight=os.environ.get("FINAL_AUDIT_PREFLIGHT_ONLY", "0") == "1",
+        )
+        print(f"FINAL AUDIT ONLY: {out}", flush=True)
+        final_colab_audit.run(args)
+    else:
+        print(f"ROOT_PATH={os.environ['ROOT_PATH']}  GALLERY_SCOPE={os.environ['GALLERY_SCOPE']}")
+        from swid_retrieval import orchestrator
+        run_dir = orchestrator.main()
+        print(f"\n===== DONE. Results: {run_dir} =====")

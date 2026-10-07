@@ -7,8 +7,7 @@ import argparse
 import ast
 import json
 import os
-import subprocess
-import sys
+import runpy
 from collections import Counter
 from pathlib import Path
 
@@ -231,7 +230,7 @@ def _input_hashes(p, ckpts, meta_caches):
     files.update({f"checkpoint_{key}": path for key, path in ckpts.items()})
     files.update({name: p["root"] / name for name in ("ID_species_public.csv", "OOD_species_public.csv")})
     package = Path(__file__).parent
-    for name in ("final_colab_audit.py", "audit_support.py", "config.py",
+    for name in ("final_colab_audit.py", "run_overnight.py", "audit_support.py", "config.py",
                  "data.py", "models.py", "gallery.py", "scurd.py",
                  "embeddings/extract.py", "experiments/audit_native_ce.py",
                  "experiments/registry.py", "experiments/rq1_native.py",
@@ -680,6 +679,19 @@ def paired_baselines(p):
     return [out]
 
 
+def _run_with_environment(script, overrides):
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        runpy.run_path(str(script), run_name="__main__")
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def raw_gallery_matrix(p, args, selected):
     if p["cache"].parent != p["root"] or p["exp4"].parent != p["root"]:
         raise ValueError("The validated gallery engine requires cache and exp4 files directly under --root")
@@ -687,9 +699,7 @@ def raw_gallery_matrix(p, args, selected):
         raise ValueError("The gallery engine requires the deployment research directory")
     engine = Path(__file__).parent / "_engines" / "variance_retrieval_evidence_colab.py"
     out = p["out"] / "raw_gallery_engine"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(p["root"]) + os.pathsep + env.get("PYTHONPATH", "")
-    env.update({
+    overrides = {
         "ROOT_PATH": str(p["root"]), "RESULTS_DIR": str(p["run"] / "deployment"),
         "OUT_DIR": str(out), "EMB_CACHE_NAME": p["cache"].name,
         "EXP4_CACHE_NAME": p["exp4"].name, "GALLERY_SCOPE": "id_only",
@@ -702,8 +712,8 @@ def raw_gallery_matrix(p, args, selected):
         "RUN_RQ5_FULL_GALLERY": "0", "RUN_SCURD_SEED_SENSITIVITY": "0",
         "RUN_TRAIN_SCURD_SEEDS": "0", "SCURD_FORCE_RETRAIN_SEEDS": "0",
         "N_GALLERY_REPEATS": str(args.gallery_repeats), "DEVICE": args.device,
-    })
-    subprocess.run([sys.executable, str(engine)], cwd=p["root"], env=env, check=True)
+    }
+    _run_with_environment(engine, overrides)
     matrix = out / "gallery_resampling_variance.csv"
     engine_df = pd.read_csv(matrix)
     expected_methods = {"DINOv2", "ArcFace-557", "CE-Full", "Fusion", "SupCon", "SC-URD"}
@@ -728,6 +738,8 @@ def raw_gallery_matrix(p, args, selected):
 
 
 def run(args):
+    if args.batch_size < 1 or args.workers < 0 or args.gallery_repeats < 1 or args.ood_kshot_repeats < 1:
+        raise ValueError("Batch size and repetitions must be positive; workers must be nonnegative")
     p = paths(args)
     os.environ["ROOT_PATH"] = str(p["root"])
     os.environ["FULL954_CACHE_NAME"] = p["cache"].name
@@ -751,25 +763,31 @@ def run(args):
     write_json(input_manifest, inputs)
     write_json(out / "preflight.json", report)
     if not completed(out, "native_ce"):
+        print("[final-audit] Native CE checkpoint/cache alignment", flush=True)
         native_out = out / "native_ce"
         if native_out.exists():
             raise ValueError(f"Unfinished native CE directory: {native_out}; inspect it before rerunning")
-        subprocess.run([sys.executable, "-m", "swid_retrieval.experiments.audit_native_ce",
-                        "--root", str(p["root"]), "--checkpoint", str(p["ce"]),
+        from .experiments.audit_native_ce import main as native_ce_main
+        native_ce_main(["--root", str(p["root"]), "--checkpoint", str(p["ce"]),
                         "--id-csv", str(p["id"]), "--cache", str(p["cache"]),
                         "--out", str(native_out),
                         "--device", args.device, "--batch-size", str(args.batch_size),
-                        "--workers", str(args.workers)], check=True)
+                        "--workers", str(args.workers)])
         finish(out, "native_ce", [native_out / "native_ce_audit.json", native_out / "native_ce_queries.npz"])
     if not completed(out, "ce_exp4"):
+        print("[final-audit] CE-Full VN26 image extraction", flush=True)
         finish(out, "ce_exp4", ce_exp4(p, args, manifest))
     if not completed(out, "ce_vn26"):
+        print("[final-audit] CE-Full VN26 scoring", flush=True)
         finish(out, "ce_vn26", ce_vn26(p))
     if not completed(out, "scurd"):
+        print("[final-audit] SC-URD raw/centered checkpoints", flush=True)
         finish(out, "scurd", scurd_audit(p, args, report, ckpts))
     if not completed(out, "raw_gallery_matrix"):
+        print("[final-audit] Full raw gallery matrix", flush=True)
         finish(out, "raw_gallery_matrix", raw_gallery_matrix(p, args, report["selected"]))
     if not completed(out, "paired_raw"):
+        print("[final-audit] Paired raw comparisons", flush=True)
         finish(out, "paired_raw", paired_baselines(p))
     native = json.loads((out / "native_ce" / "native_ce_audit.json").read_text())
     scurd = json.loads((out / "scurd_raw_centered_seed_audit.json").read_text())

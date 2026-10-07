@@ -1,8 +1,12 @@
 import tempfile
 import json
+import io
+import os
+import runpy
 import sys
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +14,8 @@ import numpy as np
 import pandas as pd
 
 from swid_retrieval.audit_support import check_labels, compare_recipes, top_matches
-from swid_retrieval.final_colab_audit import _ce_features, _validate_public_rows, _vn26_items, ce_vn26
+from swid_retrieval.final_colab_audit import (_ce_features, _run_with_environment,
+                                              _validate_public_rows, _vn26_items, ce_vn26)
 
 
 class FinalAuditTest(unittest.TestCase):
@@ -128,6 +133,31 @@ class FinalAuditTest(unittest.TestCase):
             result = json.loads((root / "ce_vn26_fresh.json").read_text())
             self.assertEqual(result["representations"]["legacy_logits_954"]["cross_domain"]["SWI_pool/VN26_all"]["mean"], 954)
             self.assertEqual(result["representations"]["features_512"]["cross_domain"]["SWI_pool/VN26_all"]["mean"], 512)
+
+    def test_engine_environment_restored_after_runpy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "engine.py"
+            script.write_text("import os\nassert os.environ['SCURD_MAIN_MODE'] == 'raw'\n")
+            with patch.dict(os.environ, {"SCURD_MAIN_MODE": "centered"}, clear=False):
+                _run_with_environment(script, {"SCURD_MAIN_MODE": "raw", "AUDIT_TEMP_FLAG": "1"})
+                self.assertEqual(os.environ["SCURD_MAIN_MODE"], "centered")
+                self.assertNotIn("AUDIT_TEMP_FLAG", os.environ)
+
+    def test_overnight_runpy_dispatches_audit_only(self):
+        import swid_retrieval.final_colab_audit as audit
+        called = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"RUN_FINAL_COLAB_AUDIT": "1",
+                                      "ROOT_PATH": tmp,
+                                      "FINAL_AUDIT_OUT": str(Path(tmp) / "audit"),
+                                      "FINAL_AUDIT_PREFLIGHT_ONLY": "0",
+                                      "FORCE_REBUILD_FULL954": "1"}, clear=False):
+                with patch.object(audit, "run", side_effect=lambda args: called.append(args)):
+                    with redirect_stdout(io.StringIO()):
+                        runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+        self.assertEqual(len(called), 1)
+        self.assertEqual(called[0].out, Path(tmp) / "audit")
+        self.assertFalse(called[0].preflight)
 
 
 if __name__ == "__main__":

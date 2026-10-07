@@ -18,7 +18,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--preflight", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for path in (args.checkpoint, args.id_csv, args.cache):
         if path is None:
             continue

@@ -3,8 +3,9 @@
 This command runs inference only. It does not train, rebuild the full-954 cache,
 or overwrite the manuscript or historical export. Run it after mounting Drive
 and synchronizing this `swid_retrieval` revision to `NCS/swid_retrieval`.
-Run `!git -C /content/drive/MyDrive/NCS/swid_retrieval pull --ff-only` in Colab
-before the cell below. The preflight must finish before starting the full run.
+The audit-only flag routes `run_overnight` directly to the audit. It ignores
+the old full-pipeline flags (`RUN_CE_CACHE_UPDATE`, `FORCE_REBUILD_FULL954`,
+`RUN_BUILD_FULL954`), so it cannot retrain or rewrite the v5 cache.
 
 Required Drive inputs under `/content/drive/MyDrive/NCS`:
 
@@ -19,24 +20,32 @@ Required Drive inputs under `/content/drive/MyDrive/NCS`:
 - The selected main SC-URD checkpoint and seed 42/43/44 checkpoints in
   `results/paper_reframe_full954_retrained_ce_corrected_public/deployment/research_directions/`
 
-Use one Colab cell after the code is present on Drive:
+Use one Colab cell. The new output directory avoids a partial audit from the
+earlier subprocess-based attempt:
 
 ```python
-import subprocess, sys
-
+%cd /content/drive/MyDrive/NCS
+!git -C swid_retrieval pull --ff-only
+import os, sys, runpy
 root = "/content/drive/MyDrive/NCS"
-cmd = [
-    sys.executable, "-m", "swid_retrieval.final_colab_audit",
-    "--root", root,
-    "--run-root", f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public",
-    "--out", f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public/final_colab_audit",
-    "--device", "cuda", "--batch-size", "64", "--workers", "4",
-]
-subprocess.run(cmd + ["--preflight"], cwd=root, check=True)
-subprocess.run(cmd, cwd=root, check=True)
+sys.path.insert(0, root)
+for name in list(sys.modules):
+    if name.startswith("swid_retrieval"):
+        del sys.modules[name]
+os.environ["ROOT_PATH"] = root
+os.environ["RUN_FINAL_COLAB_AUDIT"] = "1"
+os.environ["FINAL_AUDIT_PREFLIGHT_ONLY"] = "0"
+os.environ["FINAL_AUDIT_RUN_ROOT"] = f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public"
+os.environ["FINAL_AUDIT_OUT"] = f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public/final_colab_audit_runpy_20261007"
+os.environ["FINAL_AUDIT_BATCH_SIZE"] = "64"
+os.environ["FINAL_AUDIT_WORKERS"] = "4"
+os.environ["DEVICE"] = "cuda"
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 ```
 
-The command is resumable by running the same cell again. It hashes input
+Set `FINAL_AUDIT_PREFLIGHT_ONLY=1` for an input validation pass without
+starting extraction. Set it back to `0` for the full audit. The command is
+resumable by running the same cell again. It hashes input
 artifacts and evaluator source code; if any input or code changes, start with
 a **new** `--out` directory. The
 stage markers detect altered outputs. An interrupted `native_ce` write may leave
