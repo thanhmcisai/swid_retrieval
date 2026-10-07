@@ -255,9 +255,12 @@ def run():
                     raise ValueError(f"{side} repaired cache feature count failed post-write validation")
         temp.replace(target)
     meta = json.loads(base_meta_path.read_text())
+    meta.pop("old_id_csv", None)
+    meta.pop("old_ood_csv", None)
     meta.update({
         "artifact": "public_row_identity_verified", "target": str(target),
         "target_sha256": sha256(target),
+        "source_cache": str(base),
         "v3_source": str(source), "v3_sha256": source_hash,
         "v5_base": str(base), "v5_sha256": base_hash,
         "v5_meta_sha256": sha256(base_meta_path),
@@ -266,6 +269,11 @@ def run():
         "ce_full_public": "copied unchanged from v5 (fresh image extraction)",
         "other_public_features": "reindexed from v3 by exact DINOv2 image identity",
         "swi_features": "copied unchanged from v5",
+        "notes": [
+            "SWI gallery and CE-Full public arrays copied unchanged from v5.",
+            "All other public arrays reindexed from v3 using full-image DINOv2 matches.",
+            "The reconstructed pre-correction expanded CSV was not used as a row-order authority.",
+        ],
     })
     write_json(target.with_name(target.stem + "_meta.json"), meta)
     write_json(audit_dir / "summary.json", meta)
