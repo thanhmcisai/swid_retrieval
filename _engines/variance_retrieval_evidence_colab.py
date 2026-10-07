@@ -1246,7 +1246,26 @@ def train_one_scurd_seed(seed, device):
     torch, _, F = load_torch()
     ckpt_path = scurd_seed_ckpt_path(seed)
     log_path = scurd_seed_log_path(seed)
+    required_meta_hash = os.environ.get("SCURD_META_CACHE_SHA256")
     if ckpt_path.exists() and not SCURD_FORCE_RETRAIN_SEEDS:
+        if required_meta_hash:
+            existing = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            expected = {
+                "seed": int(seed), "meta_cache_sha256": required_meta_hash,
+                "epochs": int(SCURD_TRAIN_EPOCHS),
+                "episodes_per_epoch": int(SCURD_TRAIN_EPISODES),
+                "n_way": int(SCURD_N_WAY), "k_support": int(SCURD_K_SUPPORT),
+                "q_query": int(SCURD_Q_QUERY),
+                "lambda_cons": float(SCURD_TRAIN_LAMBDA_CONS),
+                "lr": float(SCURD_TRAIN_LR), "weight_decay": float(SCURD_WEIGHT_DECAY),
+                "tau": float(SCURD_TAU), "beta": float(SCURD_BETA),
+                "selection_metric": "lowest_training_loss",
+                "training_complete": True,
+            }
+            mismatches = {k: (existing.get(k), v) for k, v in expected.items()
+                          if existing.get(k) != v}
+            if mismatches:
+                raise ValueError(f"Existing SC-URD seed checkpoint has different provenance: {mismatches}")
         print(f"  loaded existing SC-URD seed checkpoint: {ckpt_path.name}")
         return ckpt_path
 
@@ -1343,6 +1362,7 @@ def train_one_scurd_seed(seed, device):
         "cache_version": SCURD_CACHE_VERSION,
         "research_cache_version": RESEARCH_CACHE_VERSION,
         "meta_cache": str(SCURD_META_CACHE),
+        "meta_cache_sha256": required_meta_hash,
     }
     torch.save(ckpt, ckpt_path)
     save_json({"config": {k: v for k, v in ckpt.items() if k not in {"model_state_dict"}}, "train_log": train_log},
