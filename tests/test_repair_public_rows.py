@@ -87,8 +87,8 @@ class PublicRowRepairTest(unittest.TestCase):
             self.assertEqual(len(groups), 1)
             report = validate_index_map(df, ["a_species", "a_species"],
                                         indices, scores, runner_up, "id",
-                                        equivalent_duplicates=equivalent)
-            self.assertEqual(report["feature_equivalent_duplicate_rows"], 2)
+                                        resolved_duplicates=equivalent)
+            self.assertEqual(report["resolved_ambiguous_rows"], 2)
 
             second.write_bytes(b"different-image")
             with np.load(cache_path, allow_pickle=False) as cache:
@@ -102,8 +102,46 @@ class PublicRowRepairTest(unittest.TestCase):
                      labels_id_dinov2=np.array(["a_species", "a_species"]))
             with np.load(cache_path, allow_pickle=False) as cache:
                 with self.assertRaisesRegex(ValueError, "cannot assign one-to-one"):
-                    resolve_feature_equivalent_duplicates(cache, df, "id",
-                                                          np.array([0, 0]), scores, runner_up)
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "id", np.array([0, 0]), scores, runner_up)
+
+    def test_positional_tie_requires_all_other_id_rows_to_anchor_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "a.jpg", root / "a - Copy.jpg", root / "b.jpg"]
+            for path in paths:
+                path.write_bytes(path.name.encode())
+            df = pd.DataFrame({"file_path": [str(path) for path in paths],
+                               "label": ["A species", "A species", "B species"],
+                               "source_dataset": ["VN26"] * 3})
+            cache_path = root / "v3.npz"
+            np.savez(cache_path,
+                     embs_id_dinov2=np.array([[1., 0.], [1., 0.], [0., 1.]]),
+                     embs_id_arc=np.array([[0., 1.], [1., 0.], [0., 1.]]),
+                     labels_id_dinov2=np.array(["a_species", "a_species", "b_species"]),
+                     embs_ood_dinov2=np.array([[1., 0.], [1., 0.], [0., 1.]]),
+                     embs_ood_arc=np.array([[0., 1.], [1., 0.], [0., 1.]]),
+                     labels_ood_dinov2=np.array(["a_species", "a_species", "b_species"]))
+            with np.load(cache_path, allow_pickle=False) as cache:
+                indices, allowed, groups = resolve_feature_equivalent_duplicates(
+                    cache, df, "id", np.array([1, 1, 2]),
+                    np.ones(3), np.array([1., 1., 0.5]))
+                self.assertEqual(indices.tolist(), [0, 1, 2])
+                self.assertEqual(groups[0]["resolution"], "anchored_id_position")
+                self.assertGreater(groups[0]["feature_different_candidates"][0][2], 0.1)
+                with self.assertRaisesRegex(ValueError, "cannot assign one-to-one"):
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "id", np.array([1, 1, 0]),
+                        np.ones(3), np.array([1., 1., 0.5]))
+                with self.assertRaisesRegex(ValueError, "cannot assign one-to-one"):
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "ood", np.array([1, 1, 2]),
+                        np.ones(3), np.array([1., 1., 0.5]))
+                paths[1].write_bytes(paths[0].read_bytes())
+                with self.assertRaisesRegex(ValueError, "identical image bytes but v3 features disagree"):
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "id", np.array([1, 1, 2]),
+                        np.ones(3), np.array([1., 1., 0.5]))
 
     def test_rebuild_preserves_ce_and_swi_reindexes_other_public_features(self):
         with tempfile.TemporaryDirectory() as tmp:

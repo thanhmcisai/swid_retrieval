@@ -56,7 +56,17 @@ relax thresholds merely to get a cache file.
 Exact `- Copy.jpg` image pairs may have identical DINOv2 scores. The repair
 assigns them one-to-one only if their file SHA-256 values, source/label, and
 every original v3 feature/logit agree within a small numerical tolerance.
-Those decisions are recorded under `duplicate_groups` in `summary.json`.
+For public ID only, a non-equivalent pair can instead be assigned by its
+original row position when every non-tied ID row independently maps to that
+same position, both tied positions have the expected label and DINOv2 match,
+the two filenames are an original/`- Copy` pair in the same folder, and the
+files have different bytes. Identical files with conflicting v3 features
+instead stop the repair: that is a source-cache inconsistency, not a tie. This
+is recorded as `anchored_id_position`, including the feature disagreement;
+it is not applied to OOD, whose old and current row orders differ. Decisions
+are recorded under `duplicate_groups` in `summary.json`. A preliminary row
+identity CSV is saved before tie resolution, so a later failure still has a
+diagnostic file.
 
 Successful output:
 
