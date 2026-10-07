@@ -41,8 +41,76 @@ def validate_correction_cohort(dfs, overrides, expected_relabelled=2901):
     return count
 
 
+def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_up,
+                                          min_margin=1e-5, max_feature_diff=5e-4):
+    """Assign duplicate images to interchangeable v3 rows only after full feature agreement."""
+    initial = np.asarray(indices, dtype=np.int64)
+    resolved = initial.copy()
+    equivalent = np.zeros(len(df), dtype=bool)
+    ambiguous = np.flatnonzero(np.asarray(scores) - np.asarray(runner_up) < min_margin)
+    if not len(ambiguous):
+        return resolved, equivalent, []
+    dino = v3[f"embs_{side}_dinov2"].astype(np.float32)
+    dino /= np.maximum(np.linalg.norm(dino, axis=1, keepdims=True), 1e-12)
+    old_labels = canonical(v3[f"labels_{side}_dinov2"])
+    keys = [key for key in _public_keys(side, v3.files)
+            if key.startswith((f"embs_{side}_", f"logits_{side}_"))]
+    arrays = {key: v3[key] for key in keys}
+    reports = []
+    for row in ambiguous:
+        if equivalent[row]:
+            continue
+        if float(scores[row]) < 0.99999:
+            raise ValueError(f"{side}: ambiguous row {row} lacks an exact DINOv2 match")
+        best = int(initial[row])
+        nearby = np.flatnonzero(dino @ dino[best] >= 1 - 2e-6)
+        candidates = []
+        rejected = []
+        max_diff = 0.0
+        for candidate in nearby:
+            if old_labels[candidate] != old_labels[best]:
+                continue
+            differences = {key: float(np.max(np.abs(arr[candidate].astype(np.float64) -
+                                                    arr[best].astype(np.float64))))
+                           for key, arr in arrays.items()}
+            worst_key = max(differences, key=differences.get)
+            difference = differences[worst_key]
+            if difference <= max_feature_diff:
+                candidates.append(int(candidate))
+                max_diff = max(max_diff, difference)
+            else:
+                rejected.append((int(candidate), worst_key, difference))
+        current = np.flatnonzero(np.isin(initial, candidates))
+        if len(candidates) < 2 or len(current) != len(candidates):
+            raise ValueError(f"{side}: ambiguous row {row} has {len(candidates)} equivalent v3 rows "
+                             f"for {len(current)} current images; cannot assign one-to-one. "
+                             f"First DINO-near but feature-different rows: {rejected[:3]}")
+        if equivalent[current].any():
+            raise ValueError(f"{side}: overlapping duplicate groups at rows {current.tolist()}")
+        if len(set(canonical(df.iloc[current]["label"]))) != 1 or \
+                len(set(df.iloc[current]["source_dataset"].astype(str))) != 1:
+            raise ValueError(f"{side}: equivalent feature group crosses current labels or sources: "
+                             f"{current.tolist()}")
+        if np.min(np.asarray(scores)[current]) < 0.99999:
+            raise ValueError(f"{side}: duplicate group contains a weak match")
+        image_hashes = {sha256(path) for path in df.iloc[current]["file_path"].astype(str)}
+        if len(image_hashes) != 1:
+            raise ValueError(f"{side}: candidate duplicate images have different file bytes: "
+                             f"{current.tolist()}")
+        resolved[current] = np.sort(candidates)
+        equivalent[current] = True
+        reports.append({"current_rows": current.tolist(), "v3_rows": sorted(candidates),
+                        "label": str(df.iloc[current[0]]["label"]),
+                        "source": str(df.iloc[current[0]]["source_dataset"]),
+                        "image_sha256": next(iter(image_hashes)),
+                        "max_abs_feature_difference": max_diff})
+    if not equivalent[ambiguous].all():
+        raise ValueError(f"{side}: some ambiguous DINOv2 matches remain unresolved")
+    return resolved, equivalent, reports
+
+
 def validate_index_map(df, old_labels, indices, scores, runner_up, side,
-                       min_cosine=0.999, min_margin=1e-5):
+                       min_cosine=0.999, min_margin=1e-5, equivalent_duplicates=None):
     """Refuse incomplete, ambiguous, reused, or cross-label v3 image matches."""
     n = len(df)
     indices = np.asarray(indices, dtype=np.int64)
@@ -55,7 +123,11 @@ def validate_index_map(df, old_labels, indices, scores, runner_up, side,
     if (indices < 0).any() or (indices >= len(old_labels)).any():
         raise ValueError(f"{side}: v3 row index out of range")
     weak = np.flatnonzero(scores < min_cosine)
-    ambiguous = np.flatnonzero(scores - runner_up < min_margin)
+    equivalent_duplicates = (np.zeros(n, dtype=bool) if equivalent_duplicates is None
+                             else np.asarray(equivalent_duplicates, dtype=bool))
+    if equivalent_duplicates.shape != (n,):
+        raise ValueError(f"{side}: duplicate resolution mask has wrong length")
+    ambiguous = np.flatnonzero((scores - runner_up < min_margin) & ~equivalent_duplicates)
     if len(weak) or len(ambiguous):
         raise ValueError(
             f"{side}: {len(weak)} weak or {len(ambiguous)} ambiguous DINOv2 matches; "
@@ -75,6 +147,7 @@ def validate_index_map(df, old_labels, indices, scores, runner_up, side,
     return {"rows": n, "matched_v3_rows": int(len(np.unique(indices))),
             "min_cosine": float(scores.min()),
             "min_margin": float((scores - runner_up).min()),
+            "feature_equivalent_duplicate_rows": int(equivalent_duplicates.sum()),
             "fsdm41_rows": int(fsdm.sum()),
             "fsdm41_old_label_differences": int(((expected != matched) & fsdm).sum())}
 
@@ -243,14 +316,21 @@ def run():
             indices, scores, runner_up = _extract_mapping(
                 dfs[side], v3[f"embs_{side}_dinov2"], side,
                 audit_dir / f"{side}_mapping.partial.npz", signature, model, transform, device)
+            initial_indices = indices.copy()
+            indices, equivalent, duplicate_groups = resolve_feature_equivalent_duplicates(
+                v3, dfs[side], side, indices, scores, runner_up)
             audit = dfs[side][["file_path", "label", "source_dataset"]].copy()
+            audit["nearest_v3_row"] = initial_indices
             audit["v3_row"] = indices
             audit["v3_label"] = np.asarray(v3[f"labels_{side}_dinov2"])[indices]
             audit["cosine"] = scores
             audit["runner_up_cosine"] = runner_up
+            audit["feature_equivalent_duplicate"] = equivalent
             audit.to_csv(audit_dir / f"{side}_row_identity.csv", index=False)
             summaries[side] = validate_index_map(
-                dfs[side], v3[f"labels_{side}_dinov2"], indices, scores, runner_up, side)
+                dfs[side], v3[f"labels_{side}_dinov2"], indices, scores, runner_up, side,
+                equivalent_duplicates=equivalent)
+            summaries[side]["duplicate_groups"] = duplicate_groups
             mappings[side] = indices
             print(f"[repair] {side}: {summaries[side]}", flush=True)
         del model

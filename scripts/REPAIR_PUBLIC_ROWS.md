@@ -49,9 +49,14 @@ _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 Image extraction may be lengthy on Drive. Progress is saved every 1024 images
 and resumes from the same audit directory after a Colab disconnect. Do not
 change the input CSVs or caches between attempts. If the job reports weak,
-ambiguous, duplicate, or wrong-label matches, stop and inspect the row-level
+unresolved ambiguous, duplicate, or wrong-label matches, stop and inspect the row-level
 `id_row_identity.csv` / `ood_row_identity.csv` in the audit directory. Do not
 relax thresholds merely to get a cache file.
+
+Exact `- Copy.jpg` image pairs may have identical DINOv2 scores. The repair
+assigns them one-to-one only if their file SHA-256 values, source/label, and
+every original v3 feature/logit agree within a small numerical tolerance.
+Those decisions are recorded under `duplicate_groups` in `summary.json`.
 
 Successful output:
 

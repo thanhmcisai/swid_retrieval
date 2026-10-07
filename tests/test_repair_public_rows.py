@@ -12,7 +12,7 @@ import pandas as pd
 
 from swid_retrieval.embeddings.repair_public_rows import (
     _extract_mapping, rebuild_arrays, validate_correction_cohort,
-    validate_index_map,
+    resolve_feature_equivalent_duplicates, validate_index_map,
 )
 
 
@@ -61,6 +61,49 @@ class PublicRowRepairTest(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 validate_index_map(self.df, self.old_labels, indices, scores,
                                    runner_up, "ood")
+
+    def test_exact_image_copies_use_distinct_feature_equivalent_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, second = root / "a.jpg", root / "a - Copy.jpg"
+            first.write_bytes(b"same-image")
+            second.write_bytes(b"same-image")
+            df = pd.DataFrame({"file_path": [str(first), str(second)],
+                               "label": ["A species", "A species"],
+                               "source_dataset": ["VN26", "VN26"]})
+            cache_path = root / "v3.npz"
+            np.savez(cache_path,
+                     embs_id_dinov2=np.array([[1.0, 0.0], [1.0, 0.0]]),
+                     embs_id_arc=np.array([[0.5, 0.5], [0.5, 0.5]]),
+                     logits_id_ce_narrow=np.array([[2.0], [2.0]]),
+                     labels_id_dinov2=np.array(["a_species", "a_species"]))
+            scores = np.array([1.0, 1.0])
+            runner_up = np.array([1.0, 1.0])
+            with np.load(cache_path, allow_pickle=False) as cache:
+                indices, equivalent, groups = resolve_feature_equivalent_duplicates(
+                    cache, df, "id", np.array([0, 0]), scores, runner_up)
+            self.assertEqual(indices.tolist(), [0, 1])
+            self.assertEqual(equivalent.tolist(), [True, True])
+            self.assertEqual(len(groups), 1)
+            report = validate_index_map(df, ["a_species", "a_species"],
+                                        indices, scores, runner_up, "id",
+                                        equivalent_duplicates=equivalent)
+            self.assertEqual(report["feature_equivalent_duplicate_rows"], 2)
+
+            second.write_bytes(b"different-image")
+            with np.load(cache_path, allow_pickle=False) as cache:
+                with self.assertRaisesRegex(ValueError, "different file bytes"):
+                    resolve_feature_equivalent_duplicates(cache, df, "id",
+                                                          np.array([0, 0]), scores, runner_up)
+            second.write_bytes(b"same-image")
+            np.savez(cache_path,
+                     embs_id_dinov2=np.array([[1.0, 0.0], [1.0, 0.0]]),
+                     embs_id_arc=np.array([[0.5, 0.5], [0.1, 0.9]]),
+                     labels_id_dinov2=np.array(["a_species", "a_species"]))
+            with np.load(cache_path, allow_pickle=False) as cache:
+                with self.assertRaisesRegex(ValueError, "cannot assign one-to-one"):
+                    resolve_feature_equivalent_duplicates(cache, df, "id",
+                                                          np.array([0, 0]), scores, runner_up)
 
     def test_rebuild_preserves_ce_and_swi_reindexes_other_public_features(self):
         with tempfile.TemporaryDirectory() as tmp:
