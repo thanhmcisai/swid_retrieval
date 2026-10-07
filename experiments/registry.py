@@ -149,13 +149,8 @@ def scurd_class_scores(query_embs, gallery_embs, gallery_labels, top_m=50, tau=0
     q, g = _norm(q), _norm(g)
     class_order = np.asarray(sorted(np.unique(gl)) if class_order is None else class_order)
     class_to_col = {c: i for i, c in enumerate(class_order)}
-    sims = q @ g.T
-    top_m_eff = min(int(top_m), sims.shape[1])
-    top_idx = np.argpartition(-sims, top_m_eff - 1, axis=1)[:, :top_m_eff]
-    top_sims = np.take_along_axis(sims, top_idx, axis=1)
-    order = np.argsort(-top_sims, axis=1)
-    top_idx = np.take_along_axis(top_idx, order, axis=1)
-    top_sims = np.take_along_axis(top_sims, order, axis=1)
+    from ..audit_support import top_matches
+    top_idx, top_sims = top_matches(q, g, k=int(top_m))
     sample_scores = np.full((len(q), len(class_order)), -1e9, dtype=np.float64)
     tau = max(float(tau), 1e-6)
     for i in range(len(q)):
@@ -197,7 +192,9 @@ def scurd_retrieval_eval(query_embs, query_labels, gallery_embs, gallery_labels,
 def method_retrieval_eval(md, query_embs, query_labels, gallery_embs, gallery_labels):
     if md.get("scurd_mode"):
         return scurd_retrieval_eval(query_embs, query_labels, gallery_embs, gallery_labels,
-                                    mode=md["scurd_mode"], prototype_mix_alpha=md.get("scurd_alpha"))
+                                    mode=md["scurd_mode"], prototype_mix_alpha=md.get("scurd_alpha"),
+                                    tau=md.get("scurd_tau", config.SCURD_TAU),
+                                    top_m=md.get("scurd_top_m", config.SCURD_TOP_M))
     macro, per_sp = recall_at_1_per_species(query_embs, query_labels, gallery_embs, gallery_labels)
     return {"mean": float(macro), "per_species": per_sp}
 

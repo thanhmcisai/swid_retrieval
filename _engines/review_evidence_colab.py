@@ -141,7 +141,9 @@ def paired_wilcoxon(a_by_sp, b_by_sp):
     try:
         from scipy.stats import wilcoxon
 
-        stat, p = wilcoxon(a, b, zero_method="wilcox")
+        # Pin the asymptotic calculation used by the archived export; SciPy's
+        # auto rule differs by version when paired differences contain ties.
+        stat, p = wilcoxon(a, b, zero_method="wilcox", method="approx")
         out.update({"statistic": float(stat), "p_value": float(p)})
     except Exception as exc:
         out.update({"statistic": None, "p_value": None, "error": str(exc)})

@@ -6,9 +6,9 @@ gallery:
   - PROTOTYPE macro-top-1: one L2-normalized centroid per species (954 anchors),
     the anchor-matched counterpart of CE's one weight vector per class. This is
     the fair paradigm headline.
-  - NATIVE CE macro accuracy: 954-way softmax argmax. Gallery-INDEPENDENT, so it
-    is identical to the previously published value (0.128); recomputed here from
-    the cached logits for self-containedness, with a carry-forward cross-check.
+  - NATIVE CE macro accuracy: softmax argmax, independent of the gallery but
+    dependent on checkpoint, preprocessing, query order and classifier class map.
+    Historical values must not be carried forward after retraining.
 
 These are standalone (no torch needed for prototype/carry-forward) so the
 validated variance script can import them, or they can be called directly.
@@ -59,9 +59,37 @@ def prototype_macro_top1(q_emb, q_labels, g_emb, g_labels, centered=False):
 def native_ce_macro(logits_id, ce_species_list, q_labels):
     """954-way native CE accuracy, macro per query species (gallery-independent)."""
     species = [_canon(s) for s in ce_species_list]
-    preds = np.array([species[i] for i in np.asarray(logits_id).argmax(axis=1)])
+    logits = np.asarray(logits_id)
+    if logits.ndim != 2 or logits.shape != (len(q_labels), len(species)):
+        raise ValueError("CE logits shape does not match query labels and ordered class map")
+    if not species or len(set(species)) != len(species):
+        raise ValueError("CE class map is empty or has duplicate canonical species")
+    if not len(q_labels) or not np.isfinite(logits).all():
+        raise ValueError("CE queries must be nonempty and logits finite")
+    if not set(map(_canon, q_labels)).issubset(species):
+        raise ValueError("Public ID labels are absent from the CE classifier class map")
+    preds = np.asarray(species)[logits.argmax(axis=1)]
     macro, per_sp = _macro(preds, [_canon(x) for x in q_labels])
     return {"mean": macro, "per_species": per_sp}
+
+
+def native_ce_from_cache(emb, q_labels):
+    """Require a class map bound to the cached logits; never guess sorted order."""
+    required = {"logits_id_ce_full", "ce_species_list", "ce_full_checkpoint_sha256",
+                "labels_id_ce_full", "paths_id_ce_full", "paths_id"}
+    missing = required - set(emb)
+    if missing:
+        raise ValueError(f"Unverified native CE cache; missing {sorted(missing)}")
+    if not np.array_equal(emb["paths_id_ce_full"], emb["paths_id"]):
+        raise ValueError("CE logit query paths are not aligned with the active query order")
+    if not np.array_equal(list(map(_canon, emb["labels_id_ce_full"])), list(map(_canon, q_labels))):
+        raise ValueError("CE logit query labels are not aligned with active query labels")
+    digest = str(np.asarray(emb["ce_full_checkpoint_sha256"]).item())
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("Invalid CE checkpoint digest")
+    result = native_ce_macro(emb["logits_id_ce_full"], emb["ce_species_list"], q_labels)
+    result["checkpoint_sha256"] = digest
+    return result
 
 
 def load_ce_species_list(ce_ckpt_path):
@@ -72,9 +100,10 @@ def load_ce_species_list(ce_ckpt_path):
 
 
 def carry_forward_native(source_results_dir):
-    """Carry the gallery-independent native accuracy forward from the original
-    rq1_paradigm.json (a list of {method, native, ...}). Exact, since native CE
-    does not depend on the retrieval gallery scope."""
+    """Read legacy values for historical comparison ONLY, not current evaluation.
+
+    Gallery independence does not establish checkpoint or query identity.
+    """
     path = Path(source_results_dir) / "rq1_paradigm.json"
     out = {}
     if not path.exists():

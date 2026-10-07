@@ -200,11 +200,7 @@ def bootstrap_values(values, n_boot=1000, seed=42):
 
 
 def nn_macro_top1(q_emb, q_labels, g_emb, g_labels):
-    q = norm(q_emb)
-    g = norm(g_emb)
-    gl = np.asarray(g_labels)
-    preds = gl[(q @ g.T).argmax(axis=1)]
-    return macro_from_preds(preds, q_labels)[0]
+    return nn_eval(q_emb, q_labels, g_emb, g_labels)["mean"]
 
 
 def _prototype_macro_top1(q_emb, q_labels, g_emb, g_labels, centered=False):
@@ -245,10 +241,12 @@ def _carry_forward_native(source_results_dir):
 
 
 def nn_eval(q_emb, q_labels, g_emb, g_labels):
+    from swid_retrieval.audit_support import top_matches
     q = norm(q_emb)
     g = norm(g_emb)
     gl = np.asarray(g_labels)
-    preds = gl[(q @ g.T).argmax(axis=1)]
+    idx, _ = top_matches(q, g)
+    preds = gl[idx[:, 0]]
     mean, per_sp = macro_from_preds(preds, q_labels)
     return {"mean": mean, "per_species": per_sp, "preds": preds}
 
@@ -288,9 +286,11 @@ def bootstrap_fpr95_difference(scores_id, scores_ood, base_id, base_ood, n_boot=
 
 
 def distance_scores(query_embs, gallery_embs):
+    from swid_retrieval.audit_support import top_matches
     q = norm(query_embs)
     g = norm(gallery_embs)
-    return 1.0 - (q @ g.T).max(axis=1)
+    _, scores = top_matches(q, g)
+    return 1.0 - scores[:, 0]
 
 
 def _scurd_mode_config(mode):
@@ -314,13 +314,8 @@ def scurd_class_scores(query_embs, gallery_embs, gallery_labels, mode=SCURD_MODE
     g = norm(g)
     classes = np.asarray(sorted(np.unique(gl)))
     class_to_col = {c: i for i, c in enumerate(classes)}
-    sims = q @ g.T
-    top_m_eff = min(int(top_m), sims.shape[1])
-    top_idx = np.argpartition(-sims, top_m_eff - 1, axis=1)[:, :top_m_eff]
-    top_sims = np.take_along_axis(sims, top_idx, axis=1)
-    order = np.argsort(-top_sims, axis=1)
-    top_idx = np.take_along_axis(top_idx, order, axis=1)
-    top_sims = np.take_along_axis(top_sims, order, axis=1)
+    from swid_retrieval.audit_support import top_matches
+    top_idx, top_sims = top_matches(q, g, k=int(top_m))
 
     logits = np.full((len(q), len(classes)), -1e9, dtype=np.float64)
     tau = max(float(tau), 1e-6)
@@ -375,8 +370,6 @@ def retrieval_quality(q_emb, q_labels, g_emb, g_labels, centered=False):
         q, g = centered_sample_space(q_emb, g_emb)
     else:
         q, g = norm(q_emb), norm(g_emb)
-    sims = q @ g.T
-    order = np.argsort(-sims, axis=1)
     ap_values, rr_values = [], []
     hit_at = {1: [], 5: [], 10: []}
     purity5 = []
@@ -385,7 +378,8 @@ def retrieval_quality(q_emb, q_labels, g_emb, g_labels, centered=False):
         n_rel = int(relevant.sum())
         if n_rel == 0:
             continue
-        ranked_rel = relevant[order[i]]
+        # Exact ranking one query at a time avoids a query-by-gallery sort matrix.
+        ranked_rel = relevant[np.argsort(-(q[i] @ g.T))]
         rel_pos = np.where(ranked_rel)[0]
         first = int(rel_pos[0]) + 1
         rr_values.append(1.0 / first)
@@ -591,22 +585,30 @@ def run_headline_recompute(methods, labels_id, labels_ood, emb=None):
     Also emits the fair RQ1 columns so the corrected tab:rq1 is one artifact:
       - Prototype (anchor-matched: one centroid per gallery species vs CE's one
         weight per class) — recomputed at the active gallery scope.
-      - Native CE (954-way softmax, gallery-INDEPENDENT) carried forward from the
-        original rq1_paradigm.json; identical to the published value by construction.
+      - Native CE from current cached logits and their bound class map; absent
+        provenance is explicitly reported, never filled from historical results.
     """
     ood_mask = ood_test_mask_from_labels(labels_ood)
     # Fair-comparison helpers: prefer the package version, fall back to inline.
     try:
         from swid_retrieval.experiments.rq1_native import (
-            prototype_macro_top1 as _pkg_proto, carry_forward_native as _pkg_native)
+            prototype_macro_top1 as _pkg_proto)
         _proto_fn = lambda md_: _pkg_proto(md_["id"], labels_id, md_["gal"], md_["gal_labels"],
-                                           centered=(md_.get("kind") == "scurd"))["mean"]
-        _native_loader = _pkg_native
+                                           centered=(md_.get("kind") == "scurd" and md_.get("scurd_mode", SCURD_MODE).startswith("centered")))["mean"]
     except Exception:
         _proto_fn = lambda md_: _prototype_macro_top1(md_["id"], labels_id, md_["gal"], md_["gal_labels"],
                                                        centered=(md_.get("kind") == "scurd"))
-        _native_loader = _carry_forward_native
-    native_map = _native_loader(os.environ.get("SOURCE_RESULTS_DIR", str(RESULTS_DIR)))
+    native_map = {}
+    native_status = "unverified_missing_current_cache"
+    if emb is not None:
+        from swid_retrieval.experiments.rq1_native import native_ce_from_cache
+        try:
+            current_native = native_ce_from_cache(emb, labels_id)
+            native_map["CE-Full"] = current_native["mean"]
+            native_status = "current_bound_logits"
+        except ValueError as exc:
+            native_status = str(exc)
+            print(f"Native CE unavailable: {exc}. Historical values NOT reused.")
     # Models whose gallery embeddings include species they trained on (memorized
     # under the full 954 gallery). ArcFace-557/DINOv2/SC-URD have clean galleries.
     memorized_models = {"CE-Full", "ArcFace-954"}
@@ -637,6 +639,7 @@ def run_headline_recompute(methods, labels_id, labels_ood, emb=None):
             "gallery_images": int(len(md["gal_labels"])),
             "gallery_species": int(len(set(md["gal_labels"]))),
             "E1A_native_ce_macro": native,
+            "native_ce_status": native_status if name == "CE-Full" else "not_applicable",
             "E1A_prototype_macro": proto,
             "E1A_public_id_macro_R1": e1a,
             "E1A_ci_lo": r1_boot["ci_lo"],
@@ -693,10 +696,11 @@ def run_headline_recompute(methods, labels_id, labels_ood, emb=None):
         "gallery_scope": GALLERY_SCOPE,
         "note": (
             "Fair RQ1 at the active gallery scope. 'native' = 954-way CE softmax "
-            "(gallery-independent; carried forward from rq1_paradigm.json). 'proto' = "
+            "(current bound logits only; null when provenance is missing). 'proto' = "
             "nearest class-centroid macro-top-1 (one centroid per gallery species), the "
             "anchor-matched counterpart of CE's one weight per class — the fair paradigm "
-            "headline. 'r1' = nearest-image retrieval (deployment-realistic). "
+            "headline. 'r1' = nearest-image retrieval for baselines, class-evidence "
+            "aggregation for SC-URD. "
             "gallery_memorized=true marks CE-Full/ArcFace-954, whose gallery embeddings "
             "include species they trained on; ArcFace-557/DINOv2/SC-URD have clean galleries."
         ),

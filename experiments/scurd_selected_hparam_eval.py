@@ -168,18 +168,23 @@ def run(run_root, force=False):
     csv_path = out_dir / "scurd_selected_hparam_eval.csv"
     json_path = out_dir / "scurd_selected_hparam_eval.json"
     force = force or os.environ.get("FORCE_SCURD_SELECTED_HPARAM_EVAL", "0") == "1"
-    if csv_path.exists() and json_path.exists() and not force:
-        print(f"  ✅ selected-hparam eval exists: {csv_path}")
-        return json.load(open(json_path))
-
     selected, selected_path = _selected_config(run_root)
     main_ckpt_name = Path(getattr(config, "SCURD_MAIN_CKPT", "")).name
     if main_ckpt_name and str(selected["checkpoint"]) != main_ckpt_name:
-        print(
-            "  ⚠️ selected checkpoint differs from configured SC-URD checkpoint: "
+        raise ValueError(
+            "Selected checkpoint differs from configured SC-URD checkpoint: "
             f"selected={selected['checkpoint']} configured={main_ckpt_name}. "
-            "This audit reuses the configured projected embeddings."
+            "Refusing to label results with a checkpoint that was not evaluated."
         )
+    if not config.SCURD_MAIN_CKPT.is_file():
+        raise FileNotFoundError(config.SCURD_MAIN_CKPT)
+    from ..audit_support import sha256
+    checkpoint_sha256 = sha256(config.SCURD_MAIN_CKPT)
+    if csv_path.exists() and json_path.exists() and not force:
+        prior = json.loads(json_path.read_text())
+        if prior.get("selected") == selected and prior.get("checkpoint_sha256") == checkpoint_sha256:
+            print(f"  selected-hparam eval exists for current checkpoint: {csv_path}")
+            return prior
     rows = []
     scopes = [
         s.strip()
@@ -208,6 +213,7 @@ def run(run_root, force=False):
     out = {
         "selected_source": str(selected_path),
         "selected": selected,
+        "checkpoint_sha256": checkpoint_sha256,
         "eval_scopes": scopes,
         "rows": rows,
         "ood_only_kshot_K10": kshot,

@@ -82,7 +82,8 @@ def run(M, out_dir):
         e4a_wilcoxon.append({"pair": label, "n_sp": len(common), "mean_a": float(a.mean()),
                              "mean_b": float(b.mean()), "delta": float(a.mean() - b.mean()), "p": p, "sig": sig})
 
-    out = {"scurd_main_mode": config.SCURD_MODE, "cross_domain": rq4a,
+    mode = M.get("SC-URD", {}).get("scurd_mode", config.SCURD_MODE)
+    out = {"scurd_main_mode": mode, "cross_domain": rq4a,
            "cross_magnification": rq4b, "e4a_wilcoxon": e4a_wilcoxon}
     os.makedirs(str(out_dir), exist_ok=True)
     path = os.path.join(str(out_dir), "rq4_generalization.json")
