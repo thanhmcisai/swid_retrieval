@@ -47,6 +47,13 @@ runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 
 The runner fails before training if meta labels/order, weak DINOv2 features,
 or sampled public/VN26 image fingerprints do not match the frozen caches.
+To diagnose a fingerprint failure without starting training, run Cell 1 with
+`os.environ["FINAL_SCURD_DIAGNOSE_ONLY"] = "1"`. The JSON report is written to
+`final_scurd_retrain_v1/image_fingerprint_diagnostics.json`; it includes
+same-row cosine and nearest-row matches in v5 and, when present, v3. Remove
+that variable (or set it to `"0"`) before a real head rerun. A near-1.0
+nearest-row match with a low same-row score indicates row-order corruption;
+low nearest scores require investigation of image identity and preprocessing.
 Existing new-run seed checkpoints are reused only when their recipe and
 meta-cache SHA-256 match. A rerun after Colab disconnect resumes remaining seeds.
 
@@ -60,8 +67,10 @@ if the original meta cache exists: preserving the old cache makes the
 controlled comparison more informative.
 
 If sampled image fingerprints fail, do not accept the old exp4/public cache
-as identity-verified. `FINAL_SCURD_IMAGE_FINGERPRINT=0` permits a head-only
-rerun, but the resulting provenance report records the image check as absent.
+as identity-verified and do not train or update manuscript numbers until the
+cause is resolved. The historical public expanded CSV was regenerated from
+folder enumeration after the original file went missing; equal row counts and
+labels do not prove that the rebuilt CSV has the original image order.
 
 ## Cell 2: small review ZIP
 

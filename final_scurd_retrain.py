@@ -170,7 +170,19 @@ def _embed_images(model, transform, paths, device):
         return F.normalize(model(imgs).float(), dim=1).cpu().numpy()
 
 
-def image_fingerprints(root, cache_path, exp4_path, device):
+def _nearest_fingerprint(actual, embs, labels=None):
+    """Locate an image embedding without trusting the reconstructed CSV row order."""
+    matrix = np.asarray(embs, dtype=np.float32)
+    matrix = matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+    scores = matrix @ actual.astype(np.float32)
+    index = int(np.argmax(scores))
+    result = {"index": index, "cosine": float(scores[index])}
+    if labels is not None:
+        result["label"] = str(labels[index])
+    return result
+
+
+def image_fingerprints(root, cache_path, exp4_path, device, source_cache_path=None):
     import torch
     from torchvision import transforms
 
@@ -182,15 +194,39 @@ def image_fingerprints(root, cache_path, exp4_path, device):
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     report = []
+    source_cache = (np.load(source_cache_path, allow_pickle=False)
+                    if source_cache_path is not None and source_cache_path.is_file() else None)
     with np.load(cache_path, allow_pickle=False) as cache:
+        manifest = json.loads((root / "swi_manifest.json").read_text())
+        swi_embs = cache["embs_swi_dinov2"]
+        offset = 0
+        for split in ("meta-train", "meta-val", "meta-test"):
+            items = manifest[split]
+            for relative in sorted(set((0, len(items) // 2, len(items) - 1))):
+                index = offset + relative
+                path = Path(items[relative][0])
+                actual = _embed_images(model, transform, [path], device)[0]
+                expected = swi_embs[index].astype(np.float32)
+                expected /= max(float(np.linalg.norm(expected)), 1e-12)
+                report.append({"side": "swi", "split": split, "row": index,
+                               "path": str(path), "source": "SWI",
+                               "cosine": float(actual @ expected)})
+            offset += len(items)
         for side in ("id", "ood"):
             df = pd.read_csv(root / f"{side.upper()}_images_expanded.csv")
             if not np.array_equal(canonical(df["label"]), canonical(cache[f"labels_{side}_dinov2"])):
                 raise ValueError(f"{side} CSV labels are not aligned to v5 cache")
             embs = cache[f"embs_{side}_dinov2"]
+            cache_labels = canonical(cache[f"labels_{side}_dinov2"])
+            old_embs = None
+            old_labels = None
+            if source_cache is not None and f"embs_{side}_dinov2" in source_cache:
+                old_embs = source_cache[f"embs_{side}_dinov2"]
+                old_labels = canonical(source_cache[f"labels_{side}_dinov2"])
             samples = []
             for _, group in df.groupby("source_dataset", sort=True):
-                samples.extend([int(group.index[0]), int(group.index[-1])])
+                samples.extend([int(group.index[0]), int(group.index[len(group) // 2]),
+                                int(group.index[-1])])
             samples = sorted(set(samples))
             for start in range(0, len(samples), 8):
                 idx = samples[start:start + 8]
@@ -201,10 +237,19 @@ def image_fingerprints(root, cache_path, exp4_path, device):
                 expected = embs[idx].astype(np.float32)
                 expected /= np.maximum(np.linalg.norm(expected, axis=1, keepdims=True), 1e-12)
                 sims = np.sum(actual * expected, axis=1)
-                for i, path, sim in zip(idx, paths, sims):
-                    report.append({"side": side, "path": str(path),
-                                   "source": str(df.iloc[i]["source_dataset"]),
-                                   "cosine": float(sim)})
+                for i, path, sim, fresh in zip(idx, paths, sims, actual):
+                    nearest = _nearest_fingerprint(fresh, embs, cache_labels)
+                    nearest["same_csv_label"] = nearest["label"] == str(cache_labels[i])
+                    nearest["source_at_index"] = str(df.iloc[nearest["index"]]["source_dataset"])
+                    row = {"side": side, "row": int(i), "path": str(path),
+                           "label": str(cache_labels[i]),
+                           "source": str(df.iloc[i]["source_dataset"]),
+                           "cosine": float(sim), "nearest_v5": nearest}
+                    if old_embs is not None:
+                        row["nearest_v3"] = _nearest_fingerprint(fresh, old_embs, old_labels)
+                    report.append(row)
+    if source_cache is not None:
+        source_cache.close()
     with np.load(exp4_path, allow_pickle=False) as exp4:
         vn_items = A._vn26_items(root)
         for mag, items in vn_items.items():
@@ -221,9 +266,8 @@ def image_fingerprints(root, cache_path, exp4_path, device):
                 report.append({"side": f"vn26_{mag}", "path": path, "source": "VN26",
                                "cosine": float(np.max(same_label @ actual))})
     del model
-    if not report or min(row["cosine"] for row in report) < 0.999:
-        raise ValueError(f"DINOv2 image fingerprint mismatch: {sorted(report, key=lambda r: r['cosine'])[:3]}")
-    return {"n_samples": len(report), "min_cosine": min(row["cosine"] for row in report),
+    return {"passed": bool(report and min(row["cosine"] for row in report) >= 0.999),
+            "n_samples": len(report), "min_cosine": min(row["cosine"] for row in report),
             "samples": report,
             "limit": "Sampled matches do not prove identity of every image in legacy exp4."}
 
@@ -261,10 +305,33 @@ def run():
             alignment["meta_train_species"], alignment["meta_val_species"]) != (124577, 18018, 557, 80):
         raise ValueError(f"Unexpected SWI meta-train/val cohort: {alignment}")
     public = validate_public(root, cache_path, manifest_path)
+    out.mkdir(parents=True, exist_ok=True)
     fingerprint = None
     if os.environ.get("FINAL_SCURD_IMAGE_FINGERPRINT", "1") == "1":
-        fingerprint = image_fingerprints(root, cache_path, exp4_path, device)
-    out.mkdir(parents=True, exist_ok=True)
+        source_cache_path = root / "embedding_cache_full954_v3.npz"
+        fingerprint = image_fingerprints(root, cache_path, exp4_path, device, source_cache_path)
+        write_json(out / "image_fingerprint_diagnostics.json", fingerprint)
+        failures = sorted((row for row in fingerprint["samples"] if row["cosine"] < 0.999),
+                          key=lambda row: row["cosine"])
+        relocated_v5 = sum(row.get("nearest_v5", {}).get("cosine", -1) >= 0.999
+                           for row in failures)
+        relocated_v3 = sum(row.get("nearest_v3", {}).get("cosine", -1) >= 0.999
+                           for row in failures)
+        print(f"[provenance] {len(failures)}/{fingerprint['n_samples']} fingerprints failed; "
+              f"nearest match in v5={relocated_v5}, v3={relocated_v3}; "
+              f"details: {out / 'image_fingerprint_diagnostics.json'}", flush=True)
+        for row in failures[:5]:
+            print(f"  {row['side']} row={row.get('row')} same-row={row['cosine']:.4f} "
+                  f"nearest-v5={row.get('nearest_v5', {}).get('cosine', float('nan')):.4f} "
+                  f"nearest-v3={row.get('nearest_v3', {}).get('cosine', float('nan')):.4f} "
+                  f"{row['path']}", flush=True)
+        if os.environ.get("FINAL_SCURD_DIAGNOSE_ONLY", "0") == "1":
+            return out
+        if not fingerprint["passed"]:
+            raise ValueError("DINOv2 image fingerprint mismatch; head training stopped. "
+                             f"Inspect {out / 'image_fingerprint_diagnostics.json'}")
+    elif os.environ.get("FINAL_SCURD_DIAGNOSE_ONLY", "0") == "1":
+        raise ValueError("FINAL_SCURD_DIAGNOSE_ONLY requires FINAL_SCURD_IMAGE_FINGERPRINT=1")
     meta_hash = sha256(meta_path)
     provenance = {
         "meta_cache": str(meta_path), "meta_cache_sha256": meta_hash,

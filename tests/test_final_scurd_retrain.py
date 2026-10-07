@@ -10,10 +10,18 @@ from unittest.mock import patch
 
 import numpy as np
 
-from swid_retrieval.final_scurd_retrain import _meta_path, validate_meta
+from swid_retrieval.final_scurd_retrain import _meta_path, _nearest_fingerprint, validate_meta
 
 
 class FinalScurdRetrainTest(unittest.TestCase):
+    def test_nearest_fingerprint_detects_row_permutation(self):
+        embs = np.array([[1, 0], [0, 1], [-1, 0]], dtype=np.float32)
+        match = _nearest_fingerprint(np.array([0, 1], dtype=np.float32),
+                                     embs, ["a", "b", "c"])
+        self.assertEqual(match["index"], 1)
+        self.assertEqual(match["label"], "b")
+        self.assertAlmostEqual(match["cosine"], 1.0)
+
     def _fixture(self, root):
         manifest = {
             "meta-train": [["a.jpg", "A species"], ["b.jpg", "B species"]],
