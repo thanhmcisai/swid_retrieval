@@ -182,6 +182,8 @@ def preflight(p):
             ce_key = _e4key("swi", "CE_Full", scale)
             if ce_key not in exp4 or f"{ce_key}_lbl" not in exp4:
                 raise KeyError(f"Missing {ce_key} in exp4 cache")
+            if exp4[ce_key].ndim != 2 or exp4[ce_key].shape[1] != 954:
+                raise ValueError(f"Legacy exp4/{ce_key} is not 954-class logits")
             check_labels([label for _, label in expected], exp4[f"{ce_key}_lbl"], f"exp4/{ce_key}")
         for mag in MAGS:
             key = _e4key("vn26", "DINOv2", mag)
@@ -190,6 +192,8 @@ def preflight(p):
             ce_key = _e4key("vn26", "CE_Full", mag)
             if ce_key not in exp4 or f"{ce_key}_lbl" not in exp4:
                 raise KeyError(f"Missing {ce_key} in exp4 cache")
+            if exp4[ce_key].ndim != 2 or exp4[ce_key].shape[1] != 954:
+                raise ValueError(f"Legacy exp4/{ce_key} is not 954-class logits")
             for method_key in (key, ce_key):
                 if Counter(canonical(label for _, label in vn_items[mag])) != Counter(canonical(exp4[f"{method_key}_lbl"])):
                     raise ValueError(f"VN26 {mag} image labels differ from exp4/{method_key}")
@@ -226,6 +230,14 @@ def _input_hashes(p, ckpts, meta_caches):
     files = {key: p[key] for key in ("cache", "exp4", "ce", "id", "ood", "correction", "manifest", "selected")}
     files.update({f"checkpoint_{key}": path for key, path in ckpts.items()})
     files.update({name: p["root"] / name for name in ("ID_species_public.csv", "OOD_species_public.csv")})
+    package = Path(__file__).parent
+    for name in ("final_colab_audit.py", "audit_support.py", "config.py",
+                 "data.py", "models.py", "gallery.py", "scurd.py",
+                 "embeddings/extract.py", "experiments/audit_native_ce.py",
+                 "experiments/registry.py", "experiments/rq1_native.py",
+                 "experiments/rq4_vn26.py",
+                 "_engines/variance_retrieval_evidence_colab.py"):
+        files[f"code_{name}"] = package / name
     for name, value in meta_caches.items():
         if value is not None and Path(value).is_file():
             files[f"training_meta_{name}"] = Path(value)
@@ -241,40 +253,39 @@ def _input_hashes(p, ckpts, meta_caches):
 
 def _ce_features(model, loader, device, count):
     from .embeddings.extract import extract_embeddings
-    features, indices, _ = extract_embeddings(model, loader, device, return_logits=True)
+    features, indices, logits = extract_embeddings(model, loader, device, return_logits=True)
     if features.ndim != 2 or features.shape != (count, 512):
         raise ValueError(f"CE extraction returned {features.shape}, expected {(count, 512)}")
-    return features, indices
+    if logits.ndim != 2 or logits.shape != (count, 954):
+        raise ValueError(f"CE logits returned {logits.shape}, expected {(count, 954)}")
+    return features, logits, indices
 
 
-def _extract_ce(model, items, args, direct_images=False):
+def _extract_ce(model, items, args):
     from PIL import Image
     from torch.utils.data import DataLoader, Dataset
-    from .data import ManifestDataset, get_transforms
+    from .data import get_transforms
     transform = get_transforms(224, augment=False)
-    if direct_images:
-        class DirectItemsDataset(Dataset):
-            def __init__(self, rows):
-                self.rows = rows
-                self.idx_to_class = {i: label for i, (_, label) in enumerate(rows)}
+    class DirectItemsDataset(Dataset):
+        def __init__(self, rows):
+            self.rows = rows
+            self.idx_to_class = {i: label for i, (_, label) in enumerate(rows)}
 
-            def __len__(self):
-                return len(self.rows)
+        def __len__(self):
+            return len(self.rows)
 
-            def __getitem__(self, i):
-                with Image.open(self.rows[i][0]) as image:
-                    pixels = np.array(image.convert("RGB"))
-                return transform(image=pixels)["image"], i
+        def __getitem__(self, i):
+            with Image.open(self.rows[i][0]) as image:
+                pixels = np.array(image.convert("RGB"))
+            return transform(image=pixels)["image"], i
 
-        ds = DirectItemsDataset(items)
-    else:
-        ds = ManifestDataset(items, transform=transform)
+    ds = DirectItemsDataset(items)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, pin_memory=args.device == "cuda")
-    features, indices = _ce_features(model, loader, args.device, len(items))
+    features, logits, indices = _ce_features(model, loader, args.device, len(items))
     labels = np.asarray([ds.idx_to_class[int(i)] for i in indices])
     check_labels([label for _, label in items], labels, "CE extraction order")
-    return features, labels
+    return features, logits, labels
 
 
 def ce_exp4(p, args, manifest):
@@ -291,17 +302,19 @@ def ce_exp4(p, args, manifest):
             items = [(path, label) for path, label in manifest["meta-test"]
                      if Path(path).parent.name == f"scale_{scale}"]
             key = _e4key("swi", "CE_Full", scale)
-            features, labels = _extract_ce(model, items, args)
+            features, logits, labels = _extract_ce(model, items, args)
             check_labels(labels, old[f"{key}_lbl"], key)
-            outputs[key], outputs[f"{key}_lbl"] = features, labels
+            outputs[key], outputs[f"{key}_feature512"] = logits, features
+            outputs[f"{key}_lbl"] = labels
             outputs[f"{key}_paths"] = np.asarray([path for path, _ in items])
         for mag in MAGS:
             key = _e4key("vn26", "CE_Full", mag)
             items = vn[mag]
-            features, labels = _extract_ce(model, items, args, direct_images=True)
+            features, logits, labels = _extract_ce(model, items, args)
             if Counter(canonical(labels)) != Counter(canonical(old[f"{key}_lbl"])):
                 raise ValueError(f"VN26 {mag} label multiset differs from prior exp4 cache")
-            outputs[key], outputs[f"{key}_lbl"] = features, labels
+            outputs[key], outputs[f"{key}_feature512"] = logits, features
+            outputs[f"{key}_lbl"] = labels
             outputs[f"{key}_paths"] = np.asarray([path for path, _ in items])
     out = p["out"] / "ce_exp4_fresh.npz"
     np.savez_compressed(out, **outputs)
@@ -310,8 +323,9 @@ def ce_exp4(p, args, manifest):
         "input_mapping": [str(p["root"] / name) for name in
                           ("ID_species_public.csv", "OOD_species_public.csv", "swi_manifest.json")],
         "transform": "get_transforms(224, augment=False)",
-        "image_reading": {"SWI": "ManifestDataset/CachedImageLoader",
-                          "VN26": "PIL RGB directly, as in original exp4"},
+        "image_reading": "PIL RGB directly for both SWI and VN26, as in original exp4",
+        "representations": {"legacy_protocol": "954-class CE logits",
+                            "sensitivity": "512-dimensional normalized penultimate features"},
         "comparison": "SWI ordered labels and VN26 label multisets match prior exp4; prior image paths unavailable",
         "n_images": {k: len(v) for k, v in outputs.items() if k.endswith("_lbl")},
     })
@@ -587,25 +601,34 @@ def scurd_audit(p, args, preflight_report, ckpts):
 
 def ce_vn26(p):
     from .experiments.rq4_vn26 import run as run_rq4
+    variants = (("legacy_logits_954", "", "CE-Full-logits954"),
+                ("features_512", "_feature512", "CE-Full-features512"))
+    results, outputs = {}, []
     with np.load(p["out"] / "ce_exp4_fresh.npz", allow_pickle=False) as cache:
-        swi = {s: (cache[_e4key("swi", "CE_Full", s)],
-                   canonical(cache[_e4key("swi", "CE_Full", s) + "_lbl"])) for s in SCALES}
-        vn = {m: (cache[_e4key("vn26", "CE_Full", m)],
-                  canonical(cache[_e4key("vn26", "CE_Full", m) + "_lbl"])) for m in MAGS}
-    swi["pool"] = (np.concatenate([swi[s][0] for s in SCALES]),
-                   np.concatenate([swi[s][1] for s in SCALES]))
-    rq4_dir = p["out"] / "ce_rq4_fresh"
-    rq4 = run_rq4({"CE-Full": {"swi_scales": swi, "vn26_mags": vn}}, rq4_dir)
+        for variant, suffix, method in variants:
+            swi = {s: (cache[_e4key("swi", "CE_Full", s) + suffix],
+                       canonical(cache[_e4key("swi", "CE_Full", s) + "_lbl"])) for s in SCALES}
+            vn = {m: (cache[_e4key("vn26", "CE_Full", m) + suffix],
+                      canonical(cache[_e4key("vn26", "CE_Full", m) + "_lbl"])) for m in MAGS}
+            swi["pool"] = (np.concatenate([swi[s][0] for s in SCALES]),
+                           np.concatenate([swi[s][1] for s in SCALES]))
+            rq4_dir = p["out"] / f"ce_rq4_{variant}"
+            rq4 = run_rq4({method: {"swi_scales": swi, "vn26_mags": vn}}, rq4_dir)
+            results[variant] = {
+                "cross_domain": {f"{g}/{q}": cell for g, queries in rq4["cross_domain"][method].items()
+                                 for q, cell in queries.items()},
+                "cross_magnification": {f"{g}/{q}": cell for g, queries in rq4["cross_magnification"][method].items()
+                                        for q, cell in queries.items()},
+            }
+            outputs.append(rq4_dir / "rq4_generalization.json")
     result = {
-        "cross_domain": {f"{g}/{q}": cell for g, queries in rq4["cross_domain"]["CE-Full"].items()
-                         for q, cell in queries.items()},
-        "cross_magnification": {f"{g}/{q}": cell for g, queries in rq4["cross_magnification"]["CE-Full"].items()
-                                for q, cell in queries.items()},
+        "primary_protocol": "legacy_logits_954",
+        "representations": results,
         "checkpoint_sha256": sha256(p["ce"]), "training_performed": False,
     }
     out = p["out"] / "ce_vn26_fresh.json"
     write_json(out, result)
-    return [out, rq4_dir / "rq4_generalization.json"]
+    return [out, *outputs]
 
 
 def paired_baselines(p):
@@ -753,7 +776,8 @@ def run(args):
     ce = json.loads((out / "ce_vn26_fresh.json").read_text())
     summary = {
         "native_ce_macro": native["mean"],
-        "ce_vn26_swi_pool_all": ce["cross_domain"]["SWI_pool/VN26_all"]["mean"],
+        "ce_vn26_legacy_logits_swi_pool_all": ce["representations"]["legacy_logits_954"]["cross_domain"]["SWI_pool/VN26_all"]["mean"],
+        "ce_vn26_features512_swi_pool_all": ce["representations"]["features_512"]["cross_domain"]["SWI_pool/VN26_all"]["mean"],
         "selected_raw_deployment": next(r for r in scurd["rows"] if r["checkpoint_role"] == "selected"
                                         and r["mode"] == "raw" and r["gallery_scope"] == "id_only"),
         "seed_recipe_metadata_match": report["recipe_comparison"]["metadata_recipe_match"],

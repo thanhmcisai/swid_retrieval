@@ -36,8 +36,9 @@ subprocess.run(cmd + ["--preflight"], cwd=root, check=True)
 subprocess.run(cmd, cwd=root, check=True)
 ```
 
-The command is resumable by running the same cell again. It hashes all input
-artifacts; if any input changes, start with a **new** `--out` directory. The
+The command is resumable by running the same cell again. It hashes input
+artifacts and evaluator source code; if any input or code changes, start with
+a **new** `--out` directory. The
 stage markers detect altered outputs. An interrupted `native_ce` write may leave
 an unfinished `native_ce/` directory; inspect it and choose a new `--out`.
 
@@ -46,8 +47,13 @@ The output folder contains:
 - `summary.json`: selected raw deployment metrics and artifact pointers.
 - `native_ce/native_ce_audit.json`: native CE macro accuracy from fresh logits,
   with per-row feature/logit comparison to the v5 cache.
-- `ce_exp4_fresh.npz`, `ce_vn26_fresh.json` and `ce_rq4_fresh/`: fresh CE-only
-  SWI-scale/VN26 embeddings and the complete RQ4 matrix with CIs.
+- `ce_exp4_fresh.npz`, `ce_vn26_fresh.json` and the `ce_rq4_*/` folders: fresh CE-only
+  SWI-scale/VN26 outputs and complete RQ4 matrices with CIs. The original exp4
+  CE-Full path uses 954-class **logits** (despite its generic embedding key) and
+  PIL RGB reading for both image sources. The audit reproduces that protocol in
+  `ce_rq4_legacy_logits_954/` and separately reports normalized 512-D
+  penultimate features in `ce_rq4_features_512/`; they must not be conflated or
+  substituted in the manuscript without revising the protocol description.
 - `scurd_raw_centered_seed_audit.json` and `.csv`: main and seed checkpoint
   results for both scoring modes, including the selected main checkpoint on
   the matched-954 gallery.
