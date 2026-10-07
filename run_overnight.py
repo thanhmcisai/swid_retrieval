@@ -107,7 +107,12 @@ if __name__ == "__main__":
     import torch
     print(f"CUDA: {torch.cuda.is_available()} "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    if os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1":
+    if os.environ.get("RUN_REPAIR_PUBLIC_ROWS", "0") == "1":
+        if os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1" or os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
+            raise ValueError("Run public row repair separately from final audit/head training")
+        from swid_retrieval.embeddings import repair_public_rows
+        repair_public_rows.run()
+    elif os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1":
         if os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
             raise ValueError("Choose only one of RUN_FINAL_SCURD_RETRAIN and RUN_FINAL_COLAB_AUDIT")
         from swid_retrieval import final_scurd_retrain

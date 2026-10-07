@@ -71,6 +71,10 @@ as identity-verified and do not train or update manuscript numbers until the
 cause is resolved. The historical public expanded CSV was regenerated from
 folder enumeration after the original file went missing; equal row counts and
 labels do not prove that the rebuilt CSV has the original image order.
+The public-OOD mismatch was confirmed and a full-row repair is documented in
+`scripts/REPAIR_PUBLIC_ROWS.md`. After v6 has been produced and verified, set
+`FINAL_SCURD_CACHE_NAME=embedding_cache_full954_v6_public_row_verified.npz`
+and use a **new** `FINAL_SCURD_OUT` (for example `final_scurd_retrain_v2`).
 
 ## Cell 2: small review ZIP
 

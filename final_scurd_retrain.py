@@ -282,7 +282,8 @@ def run():
     old_research = run_root / "deployment" / "research_directions"
     if out == run_root or out == old_research or old_research in out.parents:
         raise ValueError("FINAL_SCURD_OUT must be isolated from the historical run")
-    cache_path = root / "embedding_cache_full954_v5_retrained_ce_corrected_public.npz"
+    cache_path = root / os.environ.get(
+        "FINAL_SCURD_CACHE_NAME", "embedding_cache_full954_v5_retrained_ce_corrected_public.npz")
     exp4_path = root / "exp4_embedding_cache_v3.npz"
     manifest_path = root / "swi_manifest.json"
     selected_path = run_root / "hyperparameters" / "scurd_hyperparameter_selection.json"
