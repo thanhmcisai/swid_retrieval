@@ -11,7 +11,8 @@ import numpy as np
 import pandas as pd
 
 from swid_retrieval.embeddings.repair_public_rows import (
-    _extract_mapping, rebuild_arrays, validate_index_map,
+    _extract_mapping, rebuild_arrays, validate_correction_cohort,
+    validate_index_map,
 )
 
 
@@ -26,6 +27,22 @@ class PublicRowRepairTest(unittest.TestCase):
         self.indices = np.array([2, 1, 0])
         self.scores = np.array([1.0, 0.99999, 1.0])
         self.runner_up = np.array([0.8, 0.7, 0.6])
+
+    def test_correction_count_is_not_total_fsdm_count(self):
+        columns = ["file_path", "label", "source_dataset", "source_original_name",
+                   "corrected_name", "label_correction"]
+        dfs = {
+            "id": pd.DataFrame([["/dataset/ID/a.jpg", "a", "ID", "a", "", ""]],
+                               columns=columns),
+            "ood": pd.DataFrame([
+                ["/dataset/FSDM41/a.jpg", "b", "FSDM41", "old-b", "new-b",
+                 "FSDM41_PERMUTED_LABEL"],
+                ["/dataset/FSDM41/c.jpg", "c", "FSDM41", "unchanged", "", ""],
+            ], columns=columns),
+        }
+        self.assertEqual(validate_correction_cohort(dfs, {"old-b": "new-b"}, 1), 1)
+        with self.assertRaisesRegex(ValueError, "Expected 2"):
+            validate_correction_cohort(dfs, {"old-b": "new-b"}, 2)
 
     def test_verified_one_to_one_mapping_allows_only_fsdm_relabel(self):
         report = validate_index_map(self.df, self.old_labels, self.indices,

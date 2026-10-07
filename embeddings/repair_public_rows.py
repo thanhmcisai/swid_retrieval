@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from ..audit_support import canonical, sha256, write_json
+from ..final_colab_audit import _validate_public_rows
 
 
 SIDES = ("id", "ood")
@@ -28,6 +29,16 @@ def _public_keys(side, files):
 
 def _is_ce_full(key, side):
     return key.startswith((f"embs_{side}_ce_full_", f"logits_{side}_ce_full"))
+
+
+def validate_correction_cohort(dfs, overrides, expected_relabelled=2901):
+    """Count corrected FSDM41 labels, not all FSDM41 images."""
+    count = sum(_validate_public_rows(dfs[side], canonical(dfs[side]["label"]),
+                                      overrides, side)
+                for side in SIDES)
+    if count != expected_relabelled:
+        raise ValueError(f"Expected {expected_relabelled} FSDM41 relabelled images, found {count}")
+    return count
 
 
 def validate_index_map(df, old_labels, indices, scores, runner_up, side,
@@ -54,7 +65,9 @@ def validate_index_map(df, old_labels, indices, scores, runner_up, side,
         raise ValueError(f"{side}: v3 rows reused: {values[counts > 1][:5].tolist()}")
     expected = canonical(df["label"])
     matched = canonical(np.asarray(old_labels)[indices])
-    fsdm = df["source_dataset"].astype(str).eq("FSDM41").to_numpy()
+    fsdm = df["source_dataset"].astype(str).str.upper().eq("FSDM41")
+    fsdm |= df["file_path"].astype(str).str.contains("/FSDM41/", case=False, regex=False)
+    fsdm = fsdm.to_numpy()
     bad = np.flatnonzero((expected != matched) & ~fsdm)
     if len(bad):
         examples = [(int(i), str(expected[i]), str(matched[i])) for i in bad[:5]]
@@ -177,7 +190,8 @@ def run():
     audit_dir = audit_dir.resolve()
     if target in (source, base):
         raise ValueError("Repair target must not overwrite v3 or v5")
-    for path in (source, base, base_meta_path,
+    correction_path = root / "dataset_label_corrections.json"
+    for path in (source, base, base_meta_path, correction_path,
                  root / "ID_images_expanded.csv", root / "OOD_images_expanded.csv"):
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -198,9 +212,8 @@ def run():
     if any(dfs[side]["source_dataset"].astype(str).str.upper().eq("WOODAUTH").any()
            for side in SIDES):
         raise ValueError("WoodAuth images remain in corrected public CSVs")
-    if sum(int(dfs[side]["source_dataset"].astype(str).eq("FSDM41").sum())
-           for side in SIDES) != 2901:
-        raise ValueError("Unexpected FSDM41 cohort in corrected public CSVs")
+    overrides = json.loads(correction_path.read_text())["FSDM41"]["overrides"]
+    relabelled = validate_correction_cohort(dfs, overrides)
     if set(canonical(dfs["id"]["label"])) & set(canonical(dfs["ood"]["label"])):
         raise ValueError("Corrected public ID/OOD species overlap")
 
@@ -265,6 +278,7 @@ def run():
         "v5_base": str(base), "v5_sha256": base_hash,
         "v5_meta_sha256": sha256(base_meta_path),
         "signature": json.loads(signature), "sides": summaries,
+        "fsdm41_relabelled": relabelled,
         "public_query_source": "v3 features reindexed by full-image DINOv2 identity",
         "ce_full_public": "copied unchanged from v5 (fresh image extraction)",
         "other_public_features": "reindexed from v3 by exact DINOv2 image identity",

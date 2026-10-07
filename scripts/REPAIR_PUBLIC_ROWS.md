@@ -4,6 +4,8 @@ The sampled image fingerprint audit found 20/24 mismatched OOD rows. Every
 mismatched image has an exact DINOv2 match at another row in the original v3
 cache. Some matches cross species and source boundaries. The reconstructed
 pre-correction expanded CSV cannot be used as a v3 row-order authority.
+The reported 2,901 FSDM41 images are those **relabelled**, not necessarily
+the total FSDM41 image count; validation uses the correction marker and JSON.
 
 This job extracts DINOv2 features for all corrected public ID/OOD images,
 matches each image to its original v3 feature, and creates a **new** v6 cache.
