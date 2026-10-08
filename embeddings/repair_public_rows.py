@@ -41,9 +41,51 @@ def validate_correction_cohort(dfs, overrides, expected_relabelled=2901):
     return count
 
 
+def _anchored_ood_candidates(df, initial, scores, ambiguous, current, nearby,
+                             old_labels, dino, best, radius=30, anchors_per_side=5):
+    """Recover a local v3 row offset only when independent neighbours agree."""
+    if len(current) != 2 or len(nearby) != 2:
+        return None, None
+    source = str(df.iloc[current[0]]["source_dataset"])
+    label = canonical([df.iloc[current[0]]["label"]])[0]
+    offsets = []
+    anchor_rows = []
+    for row in current:
+        for direction in (-1, 1):
+            found = []
+            for neighbor in range(row + direction, row + direction * (radius + 1), direction):
+                if neighbor < 0 or neighbor >= len(df):
+                    break
+                if (ambiguous[neighbor] or float(scores[neighbor]) < 0.999 or
+                        str(df.iloc[neighbor]["source_dataset"]) != source or
+                        canonical([df.iloc[neighbor]["label"]])[0] != label):
+                    continue
+                found.append(neighbor)
+                if len(found) == anchors_per_side:
+                    break
+            if len(found) != anchors_per_side:
+                return None, None
+            anchor_rows.extend(found)
+            offsets.extend((int(initial[i]) - i) for i in found)
+    if len(set(offsets)) != 1:
+        return None, None
+    offset = offsets[0]
+    candidates = np.asarray(current, dtype=np.int64) + offset
+    if (np.any(candidates < 0) or np.any(candidates >= len(dino)) or
+            set(candidates.tolist()) != set(nearby.tolist()) or
+            any(old_labels[candidate] != label or
+                float(dino[candidate] @ dino[best]) < 1 - 2e-6
+                for candidate in candidates)):
+        return None, None
+    other_rows = np.setdiff1d(np.arange(len(df)), current)
+    if np.isin(initial[other_rows], candidates).any():
+        return None, None
+    return candidates.tolist(), {"offset": int(offset), "anchor_rows": anchor_rows}
+
+
 def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_up,
                                           min_margin=1e-5, max_feature_diff=5e-4):
-    """Resolve DINO ties using feature equivalence or a fully anchored ID row order."""
+    """Resolve DINO ties only with feature or independent row-order evidence."""
     initial = np.asarray(indices, dtype=np.int64)
     resolved = initial.copy()
     resolved_ties = np.zeros(len(df), dtype=bool)
@@ -60,6 +102,8 @@ def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_
     anchored_id_order = (side == "id" and len(ambiguous) <= max(2, len(df) // 200)
                          and len(anchors) > 0 and np.min(np.asarray(scores)[anchors]) >= 0.999
                          and np.array_equal(initial[anchors], anchors))
+    ambiguous_mask = np.zeros(len(df), dtype=bool)
+    ambiguous_mask[ambiguous] = True
     reports = []
     for row in ambiguous:
         if resolved_ties[row]:
@@ -86,6 +130,7 @@ def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_
                 rejected.append((int(candidate), worst_key, difference))
         current = np.flatnonzero(np.isin(initial, nearby))
         mode = "feature_equivalent"
+        anchor_evidence = None
         if (anchored_id_order and len(nearby) == 2 and len(current) == 2 and
                 set(current) == set(nearby) and
                 all(old_labels[i] == canonical([df.iloc[i]["label"]])[0] for i in current) and
@@ -96,6 +141,14 @@ def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_
                     stems[0] == stems[1] and paths[0].stem != paths[1].stem):
                 candidates = current.tolist()
                 mode = "anchored_id_position"
+                if rejected:
+                    max_diff = max(max_diff, max(item[2] for item in rejected))
+        if side == "ood" and len(candidates) != len(current):
+            anchored, anchor_evidence = _anchored_ood_candidates(
+                df, initial, scores, ambiguous_mask, current, nearby, old_labels, dino, best)
+            if anchored is not None:
+                candidates = anchored
+                mode = "anchored_ood_offset"
                 if rejected:
                     max_diff = max(max_diff, max(item[2] for item in rejected))
         if len(candidates) < 2 or len(current) != len(candidates):
@@ -114,15 +167,16 @@ def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_
         if mode == "feature_equivalent" and len(set(image_hashes)) != 1:
             raise ValueError(f"{side}: candidate duplicate images have different file bytes: "
                              f"{current.tolist()}")
-        if mode == "anchored_id_position" and len(set(image_hashes)) == 1:
+        if mode.startswith("anchored_") and len(set(image_hashes)) == 1:
             raise ValueError(
                 f"{side}: rows {current.tolist()} have identical image bytes but v3 "
                 f"features disagree ({rejected[:3]}); source cache cannot be verified "
                 "for these images")
-        resolved[current] = np.sort(candidates)
+        resolved[current] = candidates if mode == "anchored_ood_offset" else np.sort(candidates)
         resolved_ties[current] = True
         reports.append({"current_rows": current.tolist(), "v3_rows": sorted(candidates),
                         "resolution": mode,
+                        "anchor_evidence": anchor_evidence,
                         "label": str(df.iloc[current[0]]["label"]),
                         "source": str(df.iloc[current[0]]["source_dataset"]),
                         "image_sha256": image_hashes,

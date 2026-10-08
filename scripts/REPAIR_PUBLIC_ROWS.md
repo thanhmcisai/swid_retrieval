@@ -63,7 +63,15 @@ the two filenames are an original/`- Copy` pair in the same folder, and the
 files have different bytes. Identical files with conflicting v3 features
 instead stop the repair: that is a source-cache inconsistency, not a tie. This
 is recorded as `anchored_id_position`, including the feature disagreement;
-it is not applied to OOD, whose old and current row orders differ. Decisions
+it is not applied globally to OOD, whose old and current row orders differ.
+For OOD, a two-row DINOv2 tie may use a **local** source-row offset only when
+five independently matched same-species/same-source neighbours on each side
+of both current rows agree on the same offset, both predicted v3 rows have
+the expected label and DINOv2 match, neither is already used by another
+image, and the two image files are not byte-identical when old features
+disagree. The uploaded OOD audit had 12 such pairs, with offsets 2882, 3562
+or 5595 depending on the local segment; these are checked afresh, not
+hard-coded. The resolution is recorded as `anchored_ood_offset`. Decisions
 are recorded under `duplicate_groups` in `summary.json`. A preliminary row
 identity CSV is saved before tie resolution, so a later failure still has a
 diagnostic file.

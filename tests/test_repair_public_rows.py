@@ -143,6 +143,48 @@ class PublicRowRepairTest(unittest.TestCase):
                         cache, df, "id", np.array([1, 1, 2]),
                         np.ones(3), np.array([1., 1., 0.5]))
 
+    def test_ood_tie_uses_two_sided_local_offset_not_global_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            n, offset = 24, 3
+            paths = []
+            for row in range(n):
+                path = root / f"image_{row}.jpg"
+                path.write_bytes(str(row).encode())
+                paths.append(str(path))
+            df = pd.DataFrame({"file_path": paths, "label": ["A species"] * n,
+                               "source_dataset": ["WRD25"] * n})
+            old_dino = np.eye(n + offset, dtype=np.float32)
+            old_dino[11] = old_dino[17]
+            old_indices = np.arange(n) + offset
+            old_indices[8] = 17
+            scores = np.ones(n, dtype=np.float32)
+            runner_up = np.zeros(n, dtype=np.float32)
+            runner_up[[8, 14]] = 1
+            cache_path = root / "v3.npz"
+            np.savez(cache_path, embs_ood_dinov2=old_dino,
+                     embs_ood_arc=np.arange(n + offset)[:, None].astype(np.float32),
+                     labels_ood_dinov2=np.array(["a_species"] * (n + offset)))
+            with np.load(cache_path, allow_pickle=False) as cache:
+                indices, allowed, groups = resolve_feature_equivalent_duplicates(
+                    cache, df, "ood", old_indices, scores, runner_up)
+                self.assertEqual(indices[[8, 14]].tolist(), [11, 17])
+                self.assertEqual(int(allowed.sum()), 2)
+                self.assertEqual(groups[0]["resolution"], "anchored_ood_offset")
+                self.assertEqual(groups[0]["anchor_evidence"]["offset"], offset)
+                self.assertEqual(len(groups[0]["anchor_evidence"]["anchor_rows"]), 20)
+
+                conflicting = old_indices.copy()
+                conflicting[5] = 20
+                with self.assertRaisesRegex(ValueError, "cannot assign one-to-one"):
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "ood", conflicting, scores, runner_up)
+
+                Path(paths[14]).write_bytes(Path(paths[8]).read_bytes())
+                with self.assertRaisesRegex(ValueError, "identical image bytes but v3 features disagree"):
+                    resolve_feature_equivalent_duplicates(
+                        cache, df, "ood", old_indices, scores, runner_up)
+
     def test_rebuild_preserves_ce_and_swi_reindexes_other_public_features(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
