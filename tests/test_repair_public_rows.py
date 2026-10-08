@@ -15,6 +15,7 @@ from swid_retrieval.embeddings.repair_public_rows import (
     _extract_mapping, diagnose_duplicate_rows, rebuild_arrays, validate_correction_cohort,
     resolve_feature_equivalent_duplicates, validate_index_map,
 )
+from swid_retrieval.audit_support import sha256
 
 
 class PublicRowRepairTest(unittest.TestCase):
@@ -258,6 +259,59 @@ class PublicRowRepairTest(unittest.TestCase):
                        if item["key"] == "embs_ood_arc")
             self.assertEqual(arc["max_abs_difference"], 6.0)
             self.assertFalse((root / "embedding_cache_full954_v6_public_row_verified.npz").exists())
+
+    def test_opt_in_arc_anomaly_requires_matching_bytes_and_other_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            n, offset = 24, 3
+            paths = []
+            for row in range(n):
+                path = root / f"image_{row}.jpg"
+                path.write_bytes(str(row).encode())
+                paths.append(str(path))
+            Path(paths[14]).write_bytes(Path(paths[8]).read_bytes())
+            df = pd.DataFrame({"file_path": paths, "label": ["A species"] * n,
+                               "source_dataset": ["WRD25"] * n})
+            old_dino = np.eye(n + offset, dtype=np.float32)
+            old_dino[11] = old_dino[17]
+            old_indices = np.arange(n) + offset
+            old_indices[8] = 17
+            scores = np.ones(n, dtype=np.float32)
+            runner_up = np.zeros(n, dtype=np.float32)
+            runner_up[[8, 14]] = 1
+            arc = np.zeros((n + offset, 2), dtype=np.float32)
+            arc[11] = [1., 0.]
+            arc[17] = [1., 0.01]
+            proto = np.zeros((n + offset, 2), dtype=np.float32)
+            cache_path = root / "v3.npz"
+
+            def resolve():
+                with np.load(cache_path, allow_pickle=False) as cache:
+                    return resolve_feature_equivalent_duplicates(
+                        cache, df, "ood", old_indices, scores, runner_up)
+
+            np.savez(cache_path, embs_ood_dinov2=old_dino, embs_ood_arc=arc,
+                     embs_ood_proto=proto,
+                     labels_ood_dinov2=np.array(["a_species"] * (n + offset)))
+            with self.assertRaisesRegex(ValueError, "identical image bytes"):
+                resolve()
+            with patch.dict(os.environ, {"PUBLIC_REPAIR_ACCEPT_ARC_SHA256": "0" * 64}):
+                with self.assertRaisesRegex(ValueError, "identical image bytes"):
+                    resolve()
+            with patch.dict(os.environ, {"PUBLIC_REPAIR_ACCEPT_ARC_SHA256": sha256(paths[8])}):
+                indices, allowed, groups = resolve()
+                self.assertEqual(indices[[8, 14]].tolist(), [11, 17])
+                self.assertEqual(int(allowed.sum()), 2)
+                self.assertEqual(groups[0]["resolution"], "anchored_ood_arc_anomaly")
+                self.assertEqual(groups[0]["feature_exception"]["key"], "embs_ood_arc")
+                self.assertAlmostEqual(groups[0]["feature_exception"]["max_abs_difference"], 0.01)
+
+                proto[17, 0] = 0.001
+                np.savez(cache_path, embs_ood_dinov2=old_dino, embs_ood_arc=arc,
+                         embs_ood_proto=proto,
+                         labels_ood_dinov2=np.array(["a_species"] * (n + offset)))
+                with self.assertRaisesRegex(ValueError, "identical image bytes"):
+                    resolve()
 
     def test_mapping_extracts_in_csv_order_and_resumes(self):
         import torch

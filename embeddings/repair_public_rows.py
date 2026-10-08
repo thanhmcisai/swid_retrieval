@@ -83,6 +83,32 @@ def _anchored_ood_candidates(df, initial, scores, ambiguous, current, nearby,
     return candidates.tolist(), {"offset": int(offset), "anchor_rows": anchor_rows}
 
 
+def _approved_ood_arc_anomaly(arrays, candidates, image_hash):
+    """Permit only the explicitly fingerprinted, isolated historical Arc discrepancy."""
+    if (os.environ.get("PUBLIC_REPAIR_ACCEPT_ARC_SHA256") != image_hash or
+            len(image_hash) != 64 or len(candidates) != 2):
+        return None
+    arc_key = "embs_ood_arc"
+    if arc_key not in arrays:
+        return None
+    for key, arr in arrays.items():
+        if key != arc_key and not np.array_equal(arr[candidates[0]], arr[candidates[1]]):
+            return None
+    arc = arrays[arc_key]
+    left = np.asarray(arc[candidates[0]], dtype=np.float64).ravel()
+    right = np.asarray(arc[candidates[1]], dtype=np.float64).ravel()
+    if not np.isfinite(left).all() or not np.isfinite(right).all():
+        return None
+    max_diff = float(np.max(np.abs(left - right)))
+    denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+    cosine = float(left @ right / denom) if denom > 0 else -1.0
+    if not (5e-4 < max_diff <= 0.02 and cosine >= 0.99):
+        return None
+    return {"key": arc_key, "max_abs_difference": max_diff,
+            "cosine": cosine, "image_sha256": image_hash,
+            "handling": "preserve both original v3 ArcFace vectors in independently anchored row order"}
+
+
 def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_up,
                                           min_margin=1e-5, max_feature_diff=5e-4):
     """Resolve DINO ties only with feature or independent row-order evidence."""
@@ -167,16 +193,23 @@ def resolve_feature_equivalent_duplicates(v3, df, side, indices, scores, runner_
         if mode == "feature_equivalent" and len(set(image_hashes)) != 1:
             raise ValueError(f"{side}: candidate duplicate images have different file bytes: "
                              f"{current.tolist()}")
+        feature_exception = None
         if mode.startswith("anchored_") and len(set(image_hashes)) == 1:
-            raise ValueError(
-                f"{side}: rows {current.tolist()} have identical image bytes but v3 "
-                f"features disagree ({rejected[:3]}); source cache cannot be verified "
-                "for these images")
-        resolved[current] = candidates if mode == "anchored_ood_offset" else np.sort(candidates)
+            if side == "ood" and mode == "anchored_ood_offset":
+                feature_exception = _approved_ood_arc_anomaly(
+                    arrays, candidates, image_hashes[0])
+            if feature_exception is None:
+                raise ValueError(
+                    f"{side}: rows {current.tolist()} have identical image bytes but v3 "
+                    f"features disagree ({rejected[:3]}); source cache cannot be verified "
+                    "for these images")
+            mode = "anchored_ood_arc_anomaly"
+        resolved[current] = candidates if mode.startswith("anchored_ood") else np.sort(candidates)
         resolved_ties[current] = True
         reports.append({"current_rows": current.tolist(), "v3_rows": sorted(candidates),
                         "resolution": mode,
                         "anchor_evidence": anchor_evidence,
+                        "feature_exception": feature_exception,
                         "label": str(df.iloc[current[0]]["label"]),
                         "source": str(df.iloc[current[0]]["source_dataset"]),
                         "image_sha256": image_hashes,
@@ -442,6 +475,9 @@ def run():
         raise ValueError("Corrected public ID/OOD species overlap")
 
     source_hash = sha256(source)
+    expected_source_hash = os.environ.get("PUBLIC_REPAIR_EXPECTED_V3_SHA256")
+    if expected_source_hash and source_hash != expected_source_hash:
+        raise ValueError("v3 cache hash differs from the duplicate diagnostic; stop before repair")
     base_hash = sha256(base)
     signature = json.dumps({
         "v3_sha256": source_hash, "v5_sha256": base_hash,
@@ -489,6 +525,12 @@ def run():
             summaries[side]["duplicate_groups"] = duplicate_groups
             mappings[side] = indices
             print(f"[repair] {side}: {summaries[side]}", flush=True)
+        if os.environ.get("PUBLIC_REPAIR_ACCEPT_ARC_SHA256"):
+            anomalies = [group for group in summaries["ood"]["duplicate_groups"]
+                         if group["resolution"] == "anchored_ood_arc_anomaly"]
+            if len(anomalies) != 1:
+                raise ValueError(f"Expected exactly one fingerprint-approved OOD ArcFace anomaly, "
+                                 f"found {len(anomalies)}; refusing v6")
         del model
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -515,14 +557,18 @@ def run():
         "v5_meta_sha256": sha256(base_meta_path),
         "signature": json.loads(signature), "sides": summaries,
         "fsdm41_relabelled": relabelled,
-        "public_query_source": "v3 features reindexed by full-image DINOv2 identity",
+        "public_query_source": "v3 features reindexed by full-image DINOv2 matches and audited local tie anchors",
         "ce_full_public": "copied unchanged from v5 (fresh image extraction)",
-        "other_public_features": "reindexed from v3 by exact DINOv2 image identity",
+        "other_public_features": "reindexed from v3 by DINOv2 matching and audited local tie anchors",
         "swi_features": "copied unchanged from v5",
+        "legacy_arcface_source_anomalies": [
+            group for group in summaries["ood"]["duplicate_groups"]
+            if group["resolution"] == "anchored_ood_arc_anomaly"],
         "notes": [
             "SWI gallery and CE-Full public arrays copied unchanged from v5.",
-            "All other public arrays reindexed from v3 using full-image DINOv2 matches.",
+            "All other public arrays reindexed from v3 using DINOv2 matches and audited local tie anchors.",
             "The reconstructed pre-correction expanded CSV was not used as a row-order authority.",
+            "Any fingerprint-approved ArcFace source anomaly preserves historical v3 vectors; it is not a fresh image extraction.",
         ],
     })
     write_json(target.with_name(target.stem + "_meta.json"), meta)

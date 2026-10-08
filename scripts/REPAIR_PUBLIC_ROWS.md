@@ -42,6 +42,22 @@ Inspect or download
 deciding whether any legacy features can be reused. Keep the original v3/v5
 files and partial row mapping unchanged.
 
+The reviewed diagnostic found one source-cache exception: two byte-identical
+WRD25 / *Dalbergia oliveri* files whose v3 ArcFace-557 vectors differ slightly
+(cosine 0.99425, max absolute difference 0.01552); every other v3 feature and
+logit for the pair is exactly equal. Both historical v3 rows are located by the
+same independently anchored local offset as their neighbours. For this one
+pair only, the repair can preserve both original ArcFace vectors in that
+anchored order. It does **not** claim either vector can be regenerated from the
+current file bytes. The exception is opt-in and is recorded in v6 metadata and
+the row-identity audit; unrelated discrepancies still abort repair.
+
+This retains the 30,868-image cohort. Swapping the two ArcFace vectors does
+not change pooled or per-source OOD score distributions because both rows
+have the same label and source; image-indexed enrollment/K-shot outcomes
+still require sensitivity checking after v6 is built. Do not describe the
+exception as a fresh image re-extraction.
+
 This job extracts DINOv2 features for all corrected public ID/OOD images,
 matches each image to its original v3 feature, and creates a **new** v6 cache.
 It does not train or overwrite any checkpoint, v3, v4, or v5 cache. Non-CE
@@ -78,6 +94,8 @@ os.environ.update({
     "PUBLIC_REPAIR_WORKERS": "4",
     "PUBLIC_REPAIR_TARGET_CACHE_NAME": "embedding_cache_full954_v6_public_row_verified.npz",
     "PUBLIC_REPAIR_AUDIT_DIR": str(root / "results/public_row_repair_v1"),
+    "PUBLIC_REPAIR_EXPECTED_V3_SHA256": "e9a4a29354f01e93448ff7b9bc5fd3b586d2da7b4e0d1408cf0b2f9cda55fd34",
+    "PUBLIC_REPAIR_ACCEPT_ARC_SHA256": "d6fe3170912f8792469c5aadbae2ee8c08989d96753361137c546fb79860e0cf",
 })
 _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 ```
@@ -97,15 +115,16 @@ original row position when every non-tied ID row independently maps to that
 same position, both tied positions have the expected label and DINOv2 match,
 the two filenames are an original/`- Copy` pair in the same folder, and the
 files have different bytes. Identical files with conflicting v3 features
-instead stop the repair: that is a source-cache inconsistency, not a tie. This
-is recorded as `anchored_id_position`, including the feature disagreement;
+otherwise stop the repair: that is a source-cache inconsistency, not a tie.
+The ID resolution is recorded as `anchored_id_position`, including the feature disagreement;
 it is not applied globally to OOD, whose old and current row orders differ.
 For OOD, a two-row DINOv2 tie may use a **local** source-row offset only when
 five independently matched same-species/same-source neighbours on each side
 of both current rows agree on the same offset, both predicted v3 rows have
-the expected label and DINOv2 match, neither is already used by another
-image, and the two image files are not byte-identical when old features
-disagree. The uploaded OOD audit had 12 such pairs, with offsets 2882, 3562
+the expected label and DINOv2 match, and neither is already used by another
+image. If their bytes are identical but old features disagree, repair stops
+unless the SHA-pinned, ArcFace-only exception above is explicitly enabled.
+The uploaded OOD audit had 12 such pairs, with offsets 2882, 3562
 or 5595 depending on the local segment; these are checked afresh, not
 hard-coded. The resolution is recorded as `anchored_ood_offset`. Decisions
 are recorded under `duplicate_groups` in `summary.json`. A preliminary row
