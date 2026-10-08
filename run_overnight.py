@@ -19,6 +19,7 @@ seeds skip, and FULL954_RUN_STAMP is fixed so outputs resume in the same folder.
 Set RUN_FINAL_COLAB_AUDIT=1 before invoking this module to run only the
 inference-only final audit. Full-pipeline flags are ignored in that mode.
 Set RUN_FINAL_SCURD_RETRAIN=1 to run only the isolated three-seed head rerun.
+Set RUN_GALLERY_STUDY=1 to run only the isolated end-to-end gallery study.
 """
 
 import os
@@ -107,7 +108,13 @@ if __name__ == "__main__":
     import torch
     print(f"CUDA: {torch.cuda.is_available()} "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    if os.environ.get("RUN_REPAIR_PUBLIC_ROWS", "0") == "1":
+    if os.environ.get("RUN_GALLERY_STUDY", "0") == "1":
+        if any(os.environ.get(flag, "0") == "1" for flag in (
+                "RUN_REPAIR_PUBLIC_ROWS", "RUN_FINAL_SCURD_RETRAIN", "RUN_FINAL_COLAB_AUDIT")):
+            raise ValueError("Run gallery study separately from repair and final-audit modes")
+        from swid_retrieval import gallery_experiment
+        gallery_experiment.run()
+    elif os.environ.get("RUN_REPAIR_PUBLIC_ROWS", "0") == "1":
         if os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1" or os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
             raise ValueError("Run public row repair separately from final audit/head training")
         from swid_retrieval.embeddings import repair_public_rows
