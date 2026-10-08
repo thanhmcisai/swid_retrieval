@@ -15,6 +15,10 @@ weak/strong feature matrices on the selected device (about 0.71 GiB for
 124,577 images and 768-D float32 features). This removes repeated full-label
 scans, per-episode feature copies, and avoidable CPU/GPU synchronization
 without changing episode draws, optimizer steps, loss, or batch composition.
+The complete-support training path also computes all species scores in one
+masked log-sum-exp instead of launching one operation per species. Floating-
+point roundoff may differ from the older implementation, so use a new output
+directory and rerun all three seeds together.
 Low instantaneous GPU utilization is still
 normal for the small 16-way head and does not by itself imply an out-of-memory
 problem. Do not reduce episode count or enable mixed precision when comparing
@@ -47,7 +51,7 @@ os.environ["FINAL_AUDIT_RUN_ROOT"] = (
     "paper_reframe_full954_retrained_ce_corrected_public"
 )
 os.environ["FINAL_SCURD_OUT"] = (
-    "/content/drive/MyDrive/NCS/results/final_scurd_retrain_v3_v6_fast"
+    "/content/drive/MyDrive/NCS/results/final_scurd_retrain_v4_v6_vectorized"
 )
 os.environ["FULL954_CACHE_NAME"] = (
     "embedding_cache_full954_v6_public_row_verified.npz"
@@ -67,7 +71,7 @@ The runner fails before training if meta labels/order, weak DINOv2 features,
 or sampled public/VN26 image fingerprints do not match the frozen caches.
 To diagnose a fingerprint failure without starting training, run Cell 1 with
 `os.environ["FINAL_SCURD_DIAGNOSE_ONLY"] = "1"`. The JSON report is written to
-`final_scurd_retrain_v3_v6_fast/image_fingerprint_diagnostics.json`; it includes
+`final_scurd_retrain_v4_v6_vectorized/image_fingerprint_diagnostics.json`; it includes
 same-row cosine and nearest-row matches in v6 and, when present, v3. Remove
 that variable (or set it to `"0"`) before a real head rerun. A near-1.0
 nearest-row match with a low same-row score indicates row-order corruption;
@@ -98,8 +102,8 @@ The public-OOD mismatch was confirmed and a full-row repair is documented in
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
-out = Path("/content/drive/MyDrive/NCS/results/final_scurd_retrain_v3_v6_fast")
-review = out.parent / "final_scurd_retrain_v3_v6_fast_review.zip"
+out = Path("/content/drive/MyDrive/NCS/results/final_scurd_retrain_v4_v6_vectorized")
+review = out.parent / "final_scurd_retrain_v4_v6_vectorized_review.zip"
 with ZipFile(review, "w", ZIP_DEFLATED) as z:
     for folder in (out, out / "evaluation", out / "training_logs"):
         if folder.exists():

@@ -18,25 +18,37 @@ class FinalScurdRetrainTest(unittest.TestCase):
         import importlib
         import torch
 
-        engine = importlib.import_module(
-            "swid_retrieval._engines.variance_retrieval_evidence_colab")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ROOT_PATH": tmp, "RESULTS_DIR": tmp,
+                                      "OUT_DIR": str(Path(tmp) / "logs")}, clear=False):
+                engine = importlib.import_module(
+                    "swid_retrieval._engines.variance_retrieval_evidence_colab")
         generator = torch.Generator().manual_seed(17)
-        query = torch.randn(7, 5, generator=generator)
-        support = torch.randn(9, 5, generator=generator)
-        targets = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
-        old_query = query.clone().requires_grad_()
-        new_query = query.clone().requires_grad_()
-        old_support = support.clone().requires_grad_()
-        new_support = support.clone().requires_grad_()
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for counts in ([3, 3, 3], [1, 4, 2, 5], [5] * 16):
+                with self.subTest(device=device, counts=counts):
+                    query = torch.randn(7, 5, generator=generator).to(device)
+                    support = torch.randn(sum(counts), 5, generator=generator).to(device)
+                    targets = torch.repeat_interleave(
+                        torch.arange(len(counts), device=device),
+                        torch.tensor(counts, device=device))
+                    old_query = query.clone().requires_grad_()
+                    new_query = query.clone().requires_grad_()
+                    old_support = support.clone().requires_grad_()
+                    new_support = support.clone().requires_grad_()
 
-        old_logits = engine.urd_logits(old_query, old_support, targets, 3, 0.07)
-        new_logits = engine.urd_logits(
-            new_query, new_support, targets, 3, 0.07, support_complete=True)
-        torch.testing.assert_close(old_logits, new_logits, rtol=0, atol=0)
-        old_logits.sum().backward()
-        new_logits.sum().backward()
-        torch.testing.assert_close(old_query.grad, new_query.grad, rtol=0, atol=0)
-        torch.testing.assert_close(old_support.grad, new_support.grad, rtol=0, atol=0)
+                    old_logits = engine.urd_logits(
+                        old_query, old_support, targets, len(counts), 0.07)
+                    new_logits = engine.urd_logits(
+                        new_query, new_support, targets, len(counts), 0.07,
+                        support_complete=True)
+                    torch.testing.assert_close(old_logits, new_logits, rtol=1e-6, atol=1e-5)
+                    old_logits.sum().backward()
+                    new_logits.sum().backward()
+                    torch.testing.assert_close(old_query.grad, new_query.grad, rtol=1e-5, atol=1e-4)
+                    torch.testing.assert_close(old_support.grad, new_support.grad,
+                                               rtol=1e-5, atol=1e-4)
 
     def test_epoch_metric_transfer_preserves_legacy_means(self):
         import torch

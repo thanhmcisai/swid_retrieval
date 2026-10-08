@@ -1236,11 +1236,16 @@ def scurd_episode_indices(labels, n_way, k_support, q_query, rng, pool=None):
 def urd_logits(query_z, support_z, support_targets, n_way, tau, support_complete=False):
     torch, _, _ = load_torch()
     sim = query_z @ support_z.T / max(float(tau), 1e-6)
-    logits = []
     support_targets = support_targets.to(sim.device)
+    if support_complete:
+        classes = torch.arange(int(n_way), device=sim.device)
+        same_class = support_targets[None, :] == classes[:, None]
+        return torch.logsumexp(
+            sim[:, None, :].masked_fill(~same_class[None, :, :], float("-inf")), dim=-1)
+    logits = []
     for c in range(int(n_way)):
         mask = support_targets == c
-        if not support_complete and not bool(mask.any()):
+        if not bool(mask.any()):
             logits.append(torch.full((sim.shape[0],), -1e9, dtype=sim.dtype, device=sim.device))
         else:
             logits.append(torch.logsumexp(sim[:, mask], dim=1))
