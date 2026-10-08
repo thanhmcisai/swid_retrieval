@@ -7,6 +7,41 @@ pre-correction expanded CSV cannot be used as a v3 row-order authority.
 The reported 2,901 FSDM41 images are those **relabelled**, not necessarily
 the total FSDM41 image count; validation uses the correction marker and JSON.
 
+## Read-only duplicate diagnostic
+
+If the repair stops with `identical image bytes but v3 features disagree`, do
+not remove that check. The DINOv2 row mapping can be correct while one or more
+other feature arrays in v3 are inconsistent with the present image bytes.
+After the failed run has saved `ood_row_identity.csv`, run this diagnostic cell.
+It reads the saved row mapping and v3 cache, hashes only the tied image files,
+and writes a small JSON report. It does not re-extract DINOv2, train a model,
+or create v6.
+
+```python
+%cd /content/drive/MyDrive/NCS
+!git -C swid_retrieval pull
+
+import os, sys, runpy
+sys.path.insert(0, "/content/drive/MyDrive/NCS")
+for name in list(sys.modules):
+    if name.startswith("swid_retrieval"):
+        del sys.modules[name]
+
+os.environ.update({
+    "ROOT_PATH": "/content/drive/MyDrive/NCS",
+    "RUN_REPAIR_PUBLIC_ROWS": "1",
+    "PUBLIC_REPAIR_DIAGNOSE_ONLY": "1",
+    "RUN_FINAL_SCURD_RETRAIN": "0",
+    "RUN_FINAL_COLAB_AUDIT": "0",
+})
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+```
+
+Inspect or download
+`results/public_row_repair_v1/ood_duplicate_feature_diagnostics.json` before
+deciding whether any legacy features can be reused. Keep the original v3/v5
+files and partial row mapping unchanged.
+
 This job extracts DINOv2 features for all corrected public ID/OOD images,
 matches each image to its original v3 feature, and creates a **new** v6 cache.
 It does not train or overwrite any checkpoint, v3, v4, or v5 cache. Non-CE
@@ -36,6 +71,7 @@ os.environ.update({
     "ROOT_PATH": str(root),
     "DEVICE": "cuda",
     "RUN_REPAIR_PUBLIC_ROWS": "1",
+    "PUBLIC_REPAIR_DIAGNOSE_ONLY": "0",
     "RUN_FINAL_SCURD_RETRAIN": "0",
     "RUN_FINAL_COLAB_AUDIT": "0",
     "PUBLIC_REPAIR_BATCH_SIZE": "16",

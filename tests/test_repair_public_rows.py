@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import runpy
 import tempfile
@@ -11,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from swid_retrieval.embeddings.repair_public_rows import (
-    _extract_mapping, rebuild_arrays, validate_correction_cohort,
+    _extract_mapping, diagnose_duplicate_rows, rebuild_arrays, validate_correction_cohort,
     resolve_feature_equivalent_duplicates, validate_index_map,
 )
 
@@ -218,6 +219,46 @@ class PublicRowRepairTest(unittest.TestCase):
             self.assertEqual(out["labels_ood_dinov2"].tolist(),
                              ["A species", "B species", "C species"])
 
+    def test_diagnose_duplicate_rows_reads_saved_mapping_without_reextracting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            n, offset = 24, 3
+            paths = []
+            for row in range(n):
+                path = root / f"image_{row}.jpg"
+                path.write_bytes(str(row).encode())
+                paths.append(str(path))
+            Path(paths[14]).write_bytes(Path(paths[8]).read_bytes())
+            old_dino = np.eye(n + offset, dtype=np.float32)
+            old_dino[11] = old_dino[17]
+            np.savez(root / "v3.npz", embs_ood_dinov2=old_dino,
+                     embs_ood_arc=np.arange(n + offset)[:, None].astype(np.float32),
+                     labels_ood_dinov2=np.array(["a_species"] * (n + offset)))
+            old_indices = np.arange(n) + offset
+            old_indices[8] = 17
+            runner_up = np.zeros(n, dtype=np.float32)
+            runner_up[[8, 14]] = 1
+            pd.DataFrame({"file_path": paths, "label": ["A species"] * n,
+                          "source_dataset": ["WRD25"] * n,
+                          "nearest_v3_row": old_indices,
+                          "cosine": np.ones(n),
+                          "runner_up_cosine": runner_up}).to_csv(
+                              root / "ood_row_identity.csv", index=False)
+            with patch.dict(os.environ, {"ROOT_PATH": str(root),
+                                      "PUBLIC_REPAIR_AUDIT_DIR": str(root),
+                                      "PUBLIC_REPAIR_SOURCE_CACHE_NAME": "v3.npz"}):
+                out = diagnose_duplicate_rows()
+            report = json.loads(out.read_text())
+            self.assertEqual(report["ambiguous_rows"], 2)
+            self.assertEqual(report["pairs"], 1)
+            self.assertEqual(report["anchored_pairs"], 1)
+            self.assertEqual(report["identical_byte_pairs"], 1)
+            self.assertEqual(report["groups"][0]["candidate_v3_rows"], [11, 17])
+            arc = next(item for item in report["groups"][0]["features"]
+                       if item["key"] == "embs_ood_arc")
+            self.assertEqual(arc["max_abs_difference"], 6.0)
+            self.assertFalse((root / "embedding_cache_full954_v6_public_row_verified.npz").exists())
+
     def test_mapping_extracts_in_csv_order_and_resumes(self):
         import torch
         from PIL import Image
@@ -255,6 +296,7 @@ class PublicRowRepairTest(unittest.TestCase):
     def test_overnight_runpy_dispatches_repair_only(self):
         from swid_retrieval.embeddings import repair_public_rows
         with patch.dict(os.environ, {"RUN_REPAIR_PUBLIC_ROWS": "1",
+                                  "PUBLIC_REPAIR_DIAGNOSE_ONLY": "0",
                                   "RUN_FINAL_SCURD_RETRAIN": "0",
                                   "RUN_FINAL_COLAB_AUDIT": "0",
                                   "ROOT_PATH": "/tmp"}, clear=False):
@@ -262,6 +304,20 @@ class PublicRowRepairTest(unittest.TestCase):
                 with redirect_stdout(io.StringIO()):
                     runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
                 target.assert_called_once_with()
+
+    def test_overnight_runpy_dispatches_diagnostic_only(self):
+        from swid_retrieval.embeddings import repair_public_rows
+        with patch.dict(os.environ, {"RUN_REPAIR_PUBLIC_ROWS": "1",
+                                  "PUBLIC_REPAIR_DIAGNOSE_ONLY": "1",
+                                  "RUN_FINAL_SCURD_RETRAIN": "0",
+                                  "RUN_FINAL_COLAB_AUDIT": "0",
+                                  "ROOT_PATH": "/tmp"}, clear=False):
+            with patch.object(repair_public_rows, "diagnose_duplicate_rows") as diagnostic:
+                with patch.object(repair_public_rows, "run") as repair:
+                    with redirect_stdout(io.StringIO()):
+                        runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+                    diagnostic.assert_called_once_with()
+                    repair.assert_not_called()
 
 
 if __name__ == "__main__":

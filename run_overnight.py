@@ -111,7 +111,10 @@ if __name__ == "__main__":
         if os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1" or os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
             raise ValueError("Run public row repair separately from final audit/head training")
         from swid_retrieval.embeddings import repair_public_rows
-        repair_public_rows.run()
+        if os.environ.get("PUBLIC_REPAIR_DIAGNOSE_ONLY", "0") == "1":
+            repair_public_rows.diagnose_duplicate_rows()
+        else:
+            repair_public_rows.run()
     elif os.environ.get("RUN_FINAL_SCURD_RETRAIN", "0") == "1":
         if os.environ.get("RUN_FINAL_COLAB_AUDIT", "0") == "1":
             raise ValueError("Choose only one of RUN_FINAL_SCURD_RETRAIN and RUN_FINAL_COLAB_AUDIT")

@@ -230,6 +230,79 @@ def validate_index_map(df, old_labels, indices, scores, runner_up, side,
             "fsdm41_old_label_differences": int(((expected != matched) & fsdm).sum())}
 
 
+def diagnose_duplicate_rows():
+    """Audit tied OOD images and source features without extraction or cache writes."""
+    root = Path(os.environ["ROOT_PATH"]).resolve()
+    source = root / os.environ.get("PUBLIC_REPAIR_SOURCE_CACHE_NAME", "embedding_cache_full954_v3.npz")
+    audit_dir = Path(os.environ.get("PUBLIC_REPAIR_AUDIT_DIR", root / "results" / "public_row_repair_v1"))
+    audit_path = audit_dir / "ood_row_identity.csv"
+    for path in (source, audit_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    df = pd.read_csv(audit_path)
+    required = {"file_path", "label", "source_dataset", "nearest_v3_row", "cosine", "runner_up_cosine"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"OOD row audit lacks columns: {sorted(required - set(df.columns))}")
+    initial = df["nearest_v3_row"].to_numpy(dtype=np.int64)
+    scores = df["cosine"].to_numpy(dtype=np.float32)
+    ambiguous = (scores - df["runner_up_cosine"].to_numpy(dtype=np.float32)) < 1e-5
+    groups = []
+    with np.load(source, allow_pickle=False) as v3:
+        dino = v3["embs_ood_dinov2"].astype(np.float32)
+        dino /= np.maximum(np.linalg.norm(dino, axis=1, keepdims=True), 1e-12)
+        old_labels = canonical(v3["labels_ood_dinov2"])
+        seen = set()
+        for row in np.flatnonzero(ambiguous):
+            if int(row) in seen:
+                continue
+            best = int(initial[row])
+            nearby = np.flatnonzero(dino @ dino[best] >= 1 - 2e-6)
+            current = np.flatnonzero(np.isin(initial, nearby))
+            seen.update(current.tolist())
+            candidates, anchor = _anchored_ood_candidates(
+                df, initial, scores, ambiguous, current, nearby, old_labels, dino, int(best))
+            hashes = [sha256(path) for path in df.iloc[current]["file_path"].astype(str)]
+            groups.append({"current_rows": current.tolist(), "nearest_v3_row": int(best),
+                           "candidate_v3_rows": candidates,
+                           "anchor_evidence": anchor,
+                           "paths": df.iloc[current]["file_path"].astype(str).tolist(),
+                           "source": df.iloc[current]["source_dataset"].astype(str).tolist(),
+                           "labels": df.iloc[current]["label"].astype(str).tolist(),
+                           "file_sha256": hashes, "identical_bytes": len(set(hashes)) == 1,
+                           "features": []})
+        for key in _public_keys("ood", v3.files):
+            if not key.startswith(("embs_ood_", "logits_ood_")):
+                continue
+            arr = v3[key]
+            for group in groups:
+                rows = group["candidate_v3_rows"]
+                if rows is None or len(rows) != 2:
+                    continue
+                left = np.asarray(arr[rows[0]], dtype=np.float64).ravel()
+                right = np.asarray(arr[rows[1]], dtype=np.float64).ravel()
+                if not np.isfinite(left).all() or not np.isfinite(right).all():
+                    raise ValueError(f"{key}: non-finite source features at v3 rows {rows}")
+                denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+                cosine = float(left @ right / denom) if denom > 0 else None
+                group["features"].append({
+                    "key": key, "max_abs_difference": float(np.max(np.abs(left - right))),
+                    "cosine": cosine if cosine is not None and np.isfinite(cosine) else None})
+    for group in groups:
+        group["features"].sort(key=lambda row: row["max_abs_difference"], reverse=True)
+    report = {"source_cache": str(source), "source_sha256": sha256(source),
+              "audit_csv": str(audit_path), "audit_sha256": sha256(audit_path),
+              "ambiguous_rows": int(ambiguous.sum()), "pairs": len(groups),
+              "anchored_pairs": sum(group["candidate_v3_rows"] is not None for group in groups),
+              "identical_byte_pairs": sum(group["identical_bytes"] for group in groups),
+              "groups": groups}
+    out = audit_dir / "ood_duplicate_feature_diagnostics.json"
+    write_json(out, report)
+    print(f"[repair-diagnose] {report['pairs']} pairs; "
+          f"{report['identical_byte_pairs']} identical-byte pairs; "
+          f"{report['anchored_pairs']} locally anchored. Saved: {out}", flush=True)
+    return out
+
+
 def rebuild_arrays(v3, v5, dfs, mappings):
     """Copy SWI/CE from v5; align all inherited public arrays to verified paths."""
     out = {key: v5[key] for key in v5.files if not any(
