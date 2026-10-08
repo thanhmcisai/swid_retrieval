@@ -10,6 +10,39 @@ The prior selected checkpoint is **not** assumed comparable to the new seeds.
 Use the new three-seed result as a separate controlled rerun until its
 training-data/recipe identity with the selected checkpoint is established.
 
+## Head-only CPU/GPU benchmark
+
+Run this cell only after the current training cell has stopped. It uses the
+existing weak/strong meta-cache and the same episode sampler, head, optimizer,
+and loss, but writes **no checkpoint**. Online versus precomputed episode
+timings show the maximum benefit available from overlapping the sampler with
+training; CPU versus CUDA timings show whether a CPU-only head run is worth
+investigating. Precomputation time is reported separately, not hidden.
+
+```python
+%cd /content/drive/MyDrive/NCS
+!git -C swid_retrieval pull --ff-only
+
+import os, sys, runpy
+sys.path.insert(0, "/content/drive/MyDrive/NCS")
+for name in list(sys.modules):
+    if name.startswith("swid_retrieval"):
+        del sys.modules[name]
+os.environ.update({
+    "ROOT_PATH": "/content/drive/MyDrive/NCS",
+    "FINAL_AUDIT_RUN_ROOT": "/content/drive/MyDrive/NCS/results/paper_reframe_full954_retrained_ce_corrected_public",
+    "BENCH_SCURD_STEPS": "100",
+    "BENCH_SCURD_WARMUP": "10",
+    "BENCH_SCURD_OUT": "/content/drive/MyDrive/NCS/results/scurd_head_benchmark_t4.json",
+})
+_ = runpy.run_module("swid_retrieval.benchmark_scurd_head", run_name="__main__")
+```
+
+The CPU result is measured on the GPU VM, not a standard Colab CPU runtime.
+Do not switch the full runner to `DEVICE=cpu` based on this benchmark alone:
+that flag also moves the image fingerprint check and final evaluation to CPU.
+The benchmark changes neither the three-seed run folder nor its code hash.
+
 The head trainer caches species-to-image indices once per seed and keeps the
 weak/strong feature matrices on the selected device (about 0.71 GiB for
 124,577 images and 768-D float32 features). This removes repeated full-label
