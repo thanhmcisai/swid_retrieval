@@ -4,6 +4,8 @@ The backbone is trainable by default. Its image-forward and gradient replay are
 kept outside this module so the same model works for frozen and full fine-tuning.
 """
 
+from collections import OrderedDict
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -23,6 +25,62 @@ class GalleryEncoder(nn.Module):
 
     def forward(self, images):
         return self.project(self.backbone(images))
+
+
+class GalleryMemory:
+    """FIFO of detached meta-train species prototypes used as distractors.
+
+    Current support and query images retain full gradients. Memory vectors are
+    stale negatives and must never contain validation or public images.
+    """
+
+    def __init__(self, capacity=256, min_classes=80):
+        self.capacity = int(capacity)
+        self.min_classes = int(min_classes)
+        if self.capacity < 0 or self.min_classes < 0 or self.min_classes > self.capacity:
+            raise ValueError("Invalid gallery memory capacity or warmup")
+        self.entries = OrderedDict()
+
+    def __len__(self):
+        return len(self.entries)
+
+    def add(self, embeddings, labels):
+        if self.capacity == 0:
+            return
+        labels = labels.detach().cpu().long()
+        embeddings = embeddings.detach().float().cpu()
+        for label in labels.unique(sorted=True):
+            key = int(label)
+            prototype = F.normalize(embeddings[labels == label].mean(0), dim=0)
+            self.entries.pop(key, None)
+            self.entries[key] = prototype
+            if len(self.entries) > self.capacity:
+                self.entries.popitem(last=False)
+
+    def distractors(self, active_labels, n_way, device):
+        if len(self.entries) < self.min_classes:
+            return None
+        active = {int(label) for label in active_labels.detach().cpu().tolist()}
+        selected = [vector for label, vector in self.entries.items() if label not in active]
+        if not selected:
+            return None
+        vectors = torch.stack(selected).to(device)
+        labels = torch.arange(n_way, n_way + len(selected), device=device)
+        return vectors, labels
+
+    def state_dict(self):
+        return {"capacity": self.capacity, "min_classes": self.min_classes,
+                "labels": list(self.entries), "vectors": [v.clone() for v in self.entries.values()]}
+
+    def load_state_dict(self, state):
+        if state["capacity"] != self.capacity or state["min_classes"] != self.min_classes:
+            raise ValueError("Gallery memory recipe changed")
+        if len(state["labels"]) != len(state["vectors"]) or len(state["labels"]) > self.capacity:
+            raise ValueError("Invalid gallery memory checkpoint")
+        if len(set(state["labels"])) != len(state["labels"]):
+            raise ValueError("Repeated class in gallery memory checkpoint")
+        self.entries = OrderedDict((int(label), vector.clone().cpu()) for label, vector in
+                                   zip(state["labels"], state["vectors"]))
 
 
 class GalleryScorer(nn.Module):
@@ -82,7 +140,7 @@ class GalleryScorer(nn.Module):
 
 def episode_objective(embeddings, scorer, n_way, n_support, n_query,
                       stability_weight=0.2, use_variable_gallery=True,
-                      pseudo_ood_weight=0.1):
+                      pseudo_ood_weight=0.1, background=None):
     """Balanced old/new episode with a smaller old-only reference gallery."""
     n_support_total = n_way * n_support
     support = embeddings[:n_support_total]
@@ -92,19 +150,35 @@ def episode_objective(embeddings, scorer, n_way, n_support, n_query,
         raise ValueError(f"Expected {expected} embeddings from a >=2-way episode")
     support_labels = torch.arange(n_way, device=embeddings.device).repeat_interleave(n_support)
     query_labels = torch.arange(n_way, device=embeddings.device).repeat_interleave(n_query)
-    large_scores, _ = scorer(query, support, support_labels)
+    if background is not None:
+        negative_refs, negative_labels = background
+        if negative_refs.requires_grad or bool((negative_labels < n_way).any()):
+            raise ValueError("Background must contain detached, disjoint distractors")
+        large_gallery = torch.cat((support, negative_refs), dim=0)
+        large_labels = torch.cat((support_labels, negative_labels), dim=0)
+    else:
+        large_gallery, large_labels = support, support_labels
+    large_scores, _ = scorer(query, large_gallery, large_labels)
     loss = F.cross_entropy(large_scores, query_labels)
-    diagnostics = {"large_ce": float(loss.detach())}
+    diagnostics = {"large_ce": float(loss.detach()),
+                   "gallery_images": len(large_gallery),
+                   "gallery_species": int(large_labels.unique().numel()),
+                   "top_m_active": len(large_gallery) > scorer.top_m}
     if use_variable_gallery:
         n_old = n_way // 2
         old_support = support[:n_old * n_support].reshape(n_old, n_support, -1)[:, 0, :]
         old_query = query[:n_old * n_query]
         small_labels = torch.arange(n_old, device=embeddings.device)
-        old_scores, _ = scorer(old_query, old_support, small_labels)
+        if background is not None:
+            old_gallery = torch.cat((old_support, negative_refs), dim=0)
+            old_labels = torch.cat((small_labels, negative_labels), dim=0)
+        else:
+            old_gallery, old_labels = old_support, small_labels
+        old_scores, _ = scorer(old_query, old_gallery, old_labels)
         old_targets = query_labels[:len(old_query)]
         old_ce = F.cross_entropy(old_scores, old_targets)
-        # The expanded gallery introduces new negative species. A margin loss
-        # explicitly penalizes loss of old-species identity after enrollment.
+        # The expanded gallery introduces new episode species, while detached
+        # meta-train prototypes supply additional competitors in both views.
         old_large = large_scores[:len(old_query)]
         true_score = old_large.gather(1, old_targets[:, None]).squeeze(1)
         new_score = old_large[:, n_old:].amax(dim=1)
@@ -120,14 +194,20 @@ def episode_objective(embeddings, scorer, n_way, n_support, n_query,
     return loss, diagnostics
 
 
-def supervised_contrastive_loss(embeddings, labels, temperature=0.07):
+def supervised_contrastive_loss(embeddings, labels, temperature=0.07, background=None):
     similarities = embeddings @ embeddings.T / temperature
     same = labels[:, None] == labels[None, :]
     diagonal = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
     positive = same & ~diagonal
     if not positive.any():
         raise ValueError("Supervised contrastive loss needs at least two images per class")
-    log_prob = similarities - torch.logsumexp(similarities.masked_fill(diagonal, -1e4), dim=1)[:, None]
+    denominator_scores = similarities.masked_fill(diagonal, -1e4)
+    if background is not None:
+        if background.requires_grad:
+            raise ValueError("SupCon background must be detached")
+        denominator_scores = torch.cat((denominator_scores,
+                                        embeddings @ background.T / temperature), dim=1)
+    log_prob = similarities - torch.logsumexp(denominator_scores, dim=1)[:, None]
     per_query = -(log_prob * positive).sum(dim=1) / positive.sum(dim=1).clamp(min=1)
     return per_query[positive.any(dim=1)].mean()
 

@@ -29,6 +29,20 @@ class GalleryMethodTest(unittest.TestCase):
         self.assertEqual(classes.tolist(), [2, 5, 9])
         self.assertTrue(torch.isfinite(scores).all())
 
+    def test_image_ranking_metrics_are_separate_from_class_r1(self):
+        np, torch = self.np, self.torch
+        scorer = self.method.GalleryScorer(mode="prototype")
+        gallery = np.asarray([[1., 0.], [0.9, 0.1], [0., 1.], [0.1, 0.9]],
+                             dtype=np.float32)
+        gallery = gallery / np.linalg.norm(gallery, axis=1, keepdims=True)
+        result = self.experiment._predict(
+            scorer, np.asarray([[1., 0.], [0., 1.]], dtype=np.float32),
+            np.asarray(["a", "b"]), gallery, np.asarray(["a", "a", "b", "b"]),
+            torch.device("cpu"))
+        self.assertEqual(result["gallery_adaptive_r1"], 1.0)
+        self.assertEqual(result["image_map_at_100"], 1.0)
+        self.assertEqual(result["image_mrr_at_100"], 1.0)
+
     def test_variable_gallery_loss_reaches_encoder_features(self):
         torch = self.torch
         embeddings = torch.randn(12, 16, requires_grad=True)
@@ -62,6 +76,33 @@ class GalleryMethodTest(unittest.TestCase):
         self.assertEqual(first, second)
         for indices in first:
             self.assertEqual(len(indices), len(set(indices)))
+
+    def test_scan_disjoint_episode_and_validation(self):
+        self.assertEqual(self.experiment.source_scan_id(
+            "patch_256_1_2_from_Tw5023_2.jpg"), "tw5023")
+        items = [(f"patch_256_{patch}_0_from_Tw{species * 2 + scan + 1000}.jpg",
+                  f"genus_{species}")
+                 for species in range(24) for scan in range(2) for patch in range(6)]
+        labels = [label for _, label in items]
+        groups = [self.experiment.source_scan_id(path) for path, _ in items]
+        sampler = self.experiment.EpisodeSampler(
+            labels, (4, 8), 2, 1, 5, 42, groups=groups)
+        for indices in sampler:
+            ways = len(indices) // 3
+            for class_index in range(ways):
+                support = indices[class_index * 2:class_index * 2 + 2]
+                query = indices[ways * 2 + class_index]
+                self.assertTrue(all(groups[index] != groups[query] for index in support))
+        refs, probes = self.experiment.validation_items(
+            {"meta-val": items}, group_mode="scan_disjoint")
+        self.assertEqual(len(refs), 24 * 5)
+        self.assertEqual(len(probes), 24 * 5)
+        for species in set(labels):
+            ref_scans = {self.experiment.source_scan_id(path)
+                         for path, label in refs if label == species}
+            query_scans = {self.experiment.source_scan_id(path)
+                           for path, label in probes if label == species}
+            self.assertFalse(ref_scans & query_scans)
 
     def test_meta_val_never_uses_train_or_test(self):
         manifest = {
