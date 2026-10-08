@@ -150,6 +150,7 @@ class FinalAuditTest(unittest.TestCase):
             with patch.dict(os.environ, {"RUN_FINAL_COLAB_AUDIT": "1",
                                       "ROOT_PATH": tmp,
                                       "FINAL_AUDIT_OUT": str(Path(tmp) / "audit"),
+                                      "FINAL_AUDIT_CACHE_NAME": "embedding_cache_full954_v6_public_row_verified.npz",
                                       "FINAL_AUDIT_PREFLIGHT_ONLY": "0",
                                       "FORCE_REBUILD_FULL954": "1"}, clear=False):
                 with patch.object(audit, "run", side_effect=lambda args: called.append(args)):
@@ -157,6 +158,8 @@ class FinalAuditTest(unittest.TestCase):
                         runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
         self.assertEqual(len(called), 1)
         self.assertEqual(called[0].out, Path(tmp) / "audit")
+        self.assertEqual(called[0].cache,
+                         Path(tmp) / "embedding_cache_full954_v6_public_row_verified.npz")
         self.assertFalse(called[0].preflight)
 
 

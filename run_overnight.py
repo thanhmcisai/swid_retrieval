@@ -130,9 +130,13 @@ if __name__ == "__main__":
             "FINAL_AUDIT_RUN_ROOT",
             root / "results" / "paper_reframe_full954_retrained_ce_corrected_public"))
         out = Path(os.environ.get("FINAL_AUDIT_OUT", run_root / "final_colab_audit"))
+        cache_name = os.environ.get("FINAL_AUDIT_CACHE_NAME")
+        cache = Path(cache_name) if cache_name else None
+        if cache is not None and not cache.is_absolute():
+            cache = root / cache
         args = Namespace(
             root=root, run_root=run_root, out=out,
-            research_dir=None, cache=None, exp4=None, ce_checkpoint=None,
+            research_dir=None, cache=cache, exp4=None, ce_checkpoint=None,
             device=os.environ.get("DEVICE", "cuda"),
             batch_size=int(os.environ.get("FINAL_AUDIT_BATCH_SIZE", "64")),
             workers=int(os.environ.get("FINAL_AUDIT_WORKERS", "4")),

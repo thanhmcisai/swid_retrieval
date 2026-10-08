@@ -1,15 +1,17 @@
-# Corrected-public final audit on Colab
+# Verified-public-row final audit on Colab
 
 This command runs inference only. It does not train, rebuild the full-954 cache,
 or overwrite the manuscript or historical export. Run it after mounting Drive
 and synchronizing this `swid_retrieval` revision to `NCS/swid_retrieval`.
 The audit-only flag routes `run_overnight` directly to the audit. It ignores
 the old full-pipeline flags (`RUN_CE_CACHE_UPDATE`, `FORCE_REBUILD_FULL954`,
-`RUN_BUILD_FULL954`), so it cannot retrain or rewrite the v5 cache.
+`RUN_BUILD_FULL954`), so it cannot retrain or rewrite the v5/v6 caches.
+Set `FINAL_AUDIT_CACHE_NAME` explicitly for v6. Without that flag, the
+standalone audit still defaults to the historical v5 cache.
 
 Required Drive inputs under `/content/drive/MyDrive/NCS`:
 
-- `embedding_cache_full954_v5_retrained_ce_corrected_public.npz`
+- `embedding_cache_full954_v6_public_row_verified.npz` and its repair summary
 - `exp4_embedding_cache_v3.npz`
 - `checkpoints/ce_954sp_convnext_base.pt`
 - `ID_images_expanded.csv`, `OOD_images_expanded.csv`
@@ -33,10 +35,13 @@ for name in list(sys.modules):
     if name.startswith("swid_retrieval"):
         del sys.modules[name]
 os.environ["ROOT_PATH"] = root
+os.environ["RUN_REPAIR_PUBLIC_ROWS"] = "0"
+os.environ["RUN_FINAL_SCURD_RETRAIN"] = "0"
 os.environ["RUN_FINAL_COLAB_AUDIT"] = "1"
+os.environ["FINAL_AUDIT_CACHE_NAME"] = "embedding_cache_full954_v6_public_row_verified.npz"
 os.environ["FINAL_AUDIT_PREFLIGHT_ONLY"] = "0"
 os.environ["FINAL_AUDIT_RUN_ROOT"] = f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public"
-os.environ["FINAL_AUDIT_OUT"] = f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public/final_colab_audit_runpy_20261007"
+os.environ["FINAL_AUDIT_OUT"] = f"{root}/results/paper_reframe_full954_retrained_ce_corrected_public/final_colab_audit_v6"
 os.environ["FINAL_AUDIT_BATCH_SIZE"] = "64"
 os.environ["FINAL_AUDIT_WORKERS"] = "4"
 os.environ["DEVICE"] = "cuda"
@@ -55,7 +60,7 @@ The output folder contains:
 
 - `summary.json`: selected raw deployment metrics and artifact pointers.
 - `native_ce/native_ce_audit.json`: native CE macro accuracy from fresh logits,
-  with per-row feature/logit comparison to the v5 cache.
+  with per-row feature/logit comparison to the selected cache.
 - `ce_exp4_fresh.npz`, `ce_vn26_fresh.json` and the `ce_rq4_*/` folders: fresh CE-only
   SWI-scale/VN26 outputs and complete RQ4 matrices with CIs. The original exp4
   CE-Full path uses 954-class **logits** (despite its generic embedding key) and
