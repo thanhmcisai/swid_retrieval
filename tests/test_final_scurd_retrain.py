@@ -14,6 +14,40 @@ from swid_retrieval.final_scurd_retrain import _meta_path, _nearest_fingerprint,
 
 
 class FinalScurdRetrainTest(unittest.TestCase):
+    def test_complete_support_logits_match_legacy_values_and_gradients(self):
+        import importlib
+        import torch
+
+        engine = importlib.import_module(
+            "swid_retrieval._engines.variance_retrieval_evidence_colab")
+        generator = torch.Generator().manual_seed(17)
+        query = torch.randn(7, 5, generator=generator)
+        support = torch.randn(9, 5, generator=generator)
+        targets = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2])
+        old_query = query.clone().requires_grad_()
+        new_query = query.clone().requires_grad_()
+        old_support = support.clone().requires_grad_()
+        new_support = support.clone().requires_grad_()
+
+        old_logits = engine.urd_logits(old_query, old_support, targets, 3, 0.07)
+        new_logits = engine.urd_logits(
+            new_query, new_support, targets, 3, 0.07, support_complete=True)
+        torch.testing.assert_close(old_logits, new_logits, rtol=0, atol=0)
+        old_logits.sum().backward()
+        new_logits.sum().backward()
+        torch.testing.assert_close(old_query.grad, new_query.grad, rtol=0, atol=0)
+        torch.testing.assert_close(old_support.grad, new_support.grad, rtol=0, atol=0)
+
+    def test_epoch_metric_transfer_preserves_legacy_means(self):
+        import torch
+
+        values = np.random.RandomState(23).randn(25, 4).astype(np.float32)
+        metrics = [torch.tensor(row) for row in values]
+        batched = torch.stack(metrics).cpu().numpy().astype(np.float64)
+        for column in range(4):
+            legacy = float(np.mean([float(row[column].item()) for row in metrics]))
+            self.assertEqual(float(np.mean(batched[:, column])), legacy)
+
     def test_cached_episode_pool_preserves_legacy_rng_sequence(self):
         import importlib
 

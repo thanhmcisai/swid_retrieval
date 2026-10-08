@@ -1233,14 +1233,14 @@ def scurd_episode_indices(labels, n_way, k_support, q_query, rng, pool=None):
     )
 
 
-def urd_logits(query_z, support_z, support_targets, n_way, tau):
+def urd_logits(query_z, support_z, support_targets, n_way, tau, support_complete=False):
     torch, _, _ = load_torch()
     sim = query_z @ support_z.T / max(float(tau), 1e-6)
     logits = []
     support_targets = support_targets.to(sim.device)
     for c in range(int(n_way)):
         mask = support_targets == c
-        if not bool(mask.any()):
+        if not support_complete and not bool(mask.any()):
             logits.append(torch.full((sim.shape[0],), -1e9, dtype=sim.dtype, device=sim.device))
         else:
             logits.append(torch.logsumexp(sim[:, mask], dim=1))
@@ -1296,7 +1296,7 @@ def train_one_scurd_seed(seed, device):
 
     for ep in range(1, SCURD_TRAIN_EPOCHS + 1):
         model.train()
-        losses, cls_losses, cons_losses, accs = [], [], [], []
+        episode_metrics = []
         for _ in range(SCURD_TRAIN_EPISODES):
             sup_idx, qry_idx, ys_np, yq_np = scurd_episode_indices(
                 labels, SCURD_N_WAY, SCURD_K_SUPPORT, SCURD_Q_QUERY, rng,
@@ -1310,8 +1310,8 @@ def train_one_scurd_seed(seed, device):
             qw = model(train_w[qry_idx])
             qs = model(train_s[qry_idx])
             n_way_eff = int(yq_np.max()) + 1
-            logits_w = urd_logits(qw, support_z, ys, n_way_eff, SCURD_TAU)
-            logits_s = urd_logits(qs, support_z, ys, n_way_eff, SCURD_TAU)
+            logits_w = urd_logits(qw, support_z, ys, n_way_eff, SCURD_TAU, support_complete=True)
+            logits_s = urd_logits(qs, support_z, ys, n_way_eff, SCURD_TAU, support_complete=True)
             loss_cls = F.cross_entropy(logits_w, yq)
             pw = F.log_softmax(logits_w, dim=1)
             ps = F.log_softmax(logits_s, dim=1)
@@ -1324,17 +1324,15 @@ def train_one_scurd_seed(seed, device):
             loss.backward()
             opt.step()
             with torch.no_grad():
-                acc = float((logits_w.argmax(1) == yq).float().mean().item())
-            losses.append(float(loss.item()))
-            cls_losses.append(float(loss_cls.item()))
-            cons_losses.append(float(loss_cons.item()))
-            accs.append(acc)
+                acc = (logits_w.argmax(1) == yq).float().mean()
+                episode_metrics.append(torch.stack((loss, loss_cls, loss_cons, acc)))
+        epoch_metrics = torch.stack(episode_metrics).cpu().numpy().astype(np.float64)
         rec = {
             "epoch": ep,
-            "loss": float(np.mean(losses)),
-            "cls_loss": float(np.mean(cls_losses)),
-            "id_cons_loss": float(np.mean(cons_losses)),
-            "episode_acc": float(np.mean(accs)),
+            "loss": float(np.mean(epoch_metrics[:, 0])),
+            "cls_loss": float(np.mean(epoch_metrics[:, 1])),
+            "id_cons_loss": float(np.mean(epoch_metrics[:, 2])),
+            "episode_acc": float(np.mean(epoch_metrics[:, 3])),
             "seed": int(seed),
             "beta": float(SCURD_BETA),
         }
