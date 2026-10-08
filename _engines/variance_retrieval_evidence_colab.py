@@ -1201,7 +1201,7 @@ def load_scurd_meta_cache():
     }
 
 
-def scurd_episode_indices(labels, n_way, k_support, q_query, rng):
+def scurd_episode_pool(labels, k_support, q_query, n_way):
     labels = np.asarray(labels)
     by_sp = {sp: np.where(labels == sp)[0] for sp in np.unique(labels)}
     valid = [sp for sp, idx in by_sp.items() if len(idx) >= k_support + q_query]
@@ -1209,6 +1209,11 @@ def scurd_episode_indices(labels, n_way, k_support, q_query, rng):
         valid = [sp for sp, idx in by_sp.items() if len(idx) >= 2]
     if not valid:
         raise RuntimeError("SC-URD seed training needs at least one species with >=2 cached embeddings.")
+    return by_sp, valid
+
+
+def scurd_episode_indices(labels, n_way, k_support, q_query, rng, pool=None):
+    by_sp, valid = pool if pool is not None else scurd_episode_pool(labels, k_support, q_query, n_way)
     chosen = rng.choice(valid, size=min(int(n_way), len(valid)), replace=False)
     support, query, support_targets, query_targets = [], [], [], []
     for ci, sp in enumerate(chosen):
@@ -1272,10 +1277,15 @@ def train_one_scurd_seed(seed, device):
     print(f"  training SC-URD seed={seed} -> {ckpt_path.name}")
     set_all_seeds(seed)
     meta = load_scurd_meta_cache()
-    train_w = torch.tensor(meta["train_weak"], dtype=torch.float32)
-    train_s = torch.tensor(meta["train_strong"], dtype=torch.float32)
+    train_w = torch.as_tensor(meta["train_weak"], dtype=torch.float32, device=device)
+    train_s = torch.as_tensor(meta["train_strong"], dtype=torch.float32, device=device)
     labels = meta["train_labels"]
     in_dim = int(train_w.shape[1])
+    episode_pool = scurd_episode_pool(labels, SCURD_K_SUPPORT, SCURD_Q_QUERY, SCURD_N_WAY)
+    del meta
+    feature_gib = (train_w.numel() * train_w.element_size() +
+                   train_s.numel() * train_s.element_size()) / 1024 ** 3
+    print(f"  cached episode species; weak/strong features on {device}: {feature_gib:.2f} GiB")
 
     SCURDResidualHead = build_scurd_model_class()
     model = SCURDResidualHead(in_dim, out_dim=512, beta=SCURD_BETA, learnable_beta=False).to(device)
@@ -1289,14 +1299,17 @@ def train_one_scurd_seed(seed, device):
         losses, cls_losses, cons_losses, accs = [], [], [], []
         for _ in range(SCURD_TRAIN_EPISODES):
             sup_idx, qry_idx, ys_np, yq_np = scurd_episode_indices(
-                labels, SCURD_N_WAY, SCURD_K_SUPPORT, SCURD_Q_QUERY, rng
+                labels, SCURD_N_WAY, SCURD_K_SUPPORT, SCURD_Q_QUERY, rng,
+                pool=episode_pool,
             )
+            sup_idx = torch.as_tensor(sup_idx, dtype=torch.long, device=device)
+            qry_idx = torch.as_tensor(qry_idx, dtype=torch.long, device=device)
             ys = torch.tensor(ys_np, dtype=torch.long, device=device)
             yq = torch.tensor(yq_np, dtype=torch.long, device=device)
-            support_z = model(train_w[sup_idx].to(device))
-            qw = model(train_w[qry_idx].to(device))
-            qs = model(train_s[qry_idx].to(device))
-            n_way_eff = int(yq.max().item() + 1)
+            support_z = model(train_w[sup_idx])
+            qw = model(train_w[qry_idx])
+            qs = model(train_s[qry_idx])
+            n_way_eff = int(yq_np.max()) + 1
             logits_w = urd_logits(qw, support_z, ys, n_way_eff, SCURD_TAU)
             logits_s = urd_logits(qs, support_z, ys, n_way_eff, SCURD_TAU)
             loss_cls = F.cross_entropy(logits_w, yq)

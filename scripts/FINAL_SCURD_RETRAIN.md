@@ -10,6 +10,20 @@ The prior selected checkpoint is **not** assumed comparable to the new seeds.
 Use the new three-seed result as a separate controlled rerun until its
 training-data/recipe identity with the selected checkpoint is established.
 
+The head trainer caches species-to-image indices once per seed and keeps the
+weak/strong feature matrices on the selected device (about 0.71 GiB for
+124,577 images and 768-D float32 features). This removes repeated full-label
+scans and per-episode feature copies without changing episode draws, optimizer
+steps, loss, or batch composition. Low instantaneous GPU utilization is still
+normal for the small 16-way head and does not by itself imply an out-of-memory
+problem. Do not reduce episode count or enable mixed precision when comparing
+against the frozen three-seed recipe.
+
+If a Colab run was started with an earlier training-engine revision, let it
+finish on that revision or use a **new** `FINAL_SCURD_OUT` after pulling this
+optimization. The provenance check deliberately rejects resuming a mixed-code
+run in the same output directory; incomplete seeds cannot resume mid-epoch.
+
 ## Cell 1: head rerun and provenance
 
 ```python

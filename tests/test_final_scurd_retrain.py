@@ -14,6 +14,46 @@ from swid_retrieval.final_scurd_retrain import _meta_path, _nearest_fingerprint,
 
 
 class FinalScurdRetrainTest(unittest.TestCase):
+    def test_cached_episode_pool_preserves_legacy_rng_sequence(self):
+        import importlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ROOT_PATH": tmp, "RESULTS_DIR": tmp,
+                                      "OUT_DIR": str(Path(tmp) / "logs")}, clear=False):
+                engine = importlib.import_module(
+                    "swid_retrieval._engines.variance_retrieval_evidence_colab")
+        labels = np.repeat(np.array(["a", "b", "c", "d", "e"]), [7, 8, 6, 3, 9])
+
+        def legacy_episode(rng, n_way, k_support, q_query):
+            by_sp = {sp: np.where(labels == sp)[0] for sp in np.unique(labels)}
+            valid = [sp for sp, idx in by_sp.items() if len(idx) >= k_support + q_query]
+            if len(valid) < n_way:
+                valid = [sp for sp, idx in by_sp.items() if len(idx) >= 2]
+            chosen = rng.choice(valid, size=min(n_way, len(valid)), replace=False)
+            support, query, ys, yq = [], [], [], []
+            for ci, sp in enumerate(chosen):
+                idx = by_sp[sp].copy()
+                rng.shuffle(idx)
+                n_s = min(k_support, max(1, len(idx) // 2))
+                n_q = min(q_query, max(1, len(idx) - n_s))
+                support.extend(idx[:n_s].tolist())
+                query.extend(idx[n_s:n_s + n_q].tolist())
+                ys.extend([ci] * n_s)
+                yq.extend([ci] * n_q)
+            return tuple(np.asarray(x, dtype=np.int64) for x in (support, query, ys, yq))
+
+        for n_way, k_support, q_query in ((3, 2, 2), (5, 4, 3)):
+            with self.subTest(n_way=n_way):
+                old_rng = np.random.RandomState(42)
+                fast_rng = np.random.RandomState(42)
+                pool = engine.scurd_episode_pool(labels, k_support, q_query, n_way)
+                for _ in range(30):
+                    expected = legacy_episode(old_rng, n_way, k_support, q_query)
+                    actual = engine.scurd_episode_indices(
+                        labels, n_way, k_support, q_query, fast_rng, pool=pool)
+                    for left, right in zip(expected, actual):
+                        np.testing.assert_array_equal(left, right)
+
     def test_nearest_fingerprint_detects_row_permutation(self):
         embs = np.array([[1, 0], [0, 1], [-1, 0]], dtype=np.float32)
         match = _nearest_fingerprint(np.array([0, 1], dtype=np.float32),
