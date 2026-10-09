@@ -185,6 +185,9 @@ runner checks the warm-up seed, backbone, embedding dimension, manifest hash,
 and checkpoint file hash before training. The metric run evaluates and saves
 the warm-up initialization as epoch 0, so fine-tuning is selected only if it
 improves the pre-fine-tuning meta-validation score.
+`GALLERY_STUDY_HEAD_LR` separately controls the projection/scorer learning
+rate (default `3e-4`); record it alongside `GALLERY_STUDY_BACKBONE_LR` when
+testing conservative fine-tuning from a warm-up checkpoint.
 
 ## Colab setup
 

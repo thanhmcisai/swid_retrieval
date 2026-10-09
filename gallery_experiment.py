@@ -172,7 +172,7 @@ def variant_config(name, *, pilot=False):
         "image_batch": int(os.environ.get("GALLERY_STUDY_IMAGE_BATCH", "32")),
         "workers": int(os.environ.get("GALLERY_STUDY_WORKERS", "4")),
         "backbone_lr": float(os.environ.get("GALLERY_STUDY_BACKBONE_LR", default_backbone_lr)),
-        "head_lr": 3e-4,
+        "head_lr": float(os.environ.get("GALLERY_STUDY_HEAD_LR", "3e-4")),
         "weight_decay": 0.01,
         "stability_weight": 0.2,
         "pseudo_ood_weight": 0.1,

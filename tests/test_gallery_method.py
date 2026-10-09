@@ -66,6 +66,14 @@ class GalleryMethodTest(unittest.TestCase):
         self.assertEqual(no_memory["scorer_mode"], "nearest")
         self.assertEqual(no_memory["memory_size"], 0)
 
+    def test_head_learning_rate_override_is_recorded_in_config(self):
+        with patch.dict(os.environ, {"GALLERY_STUDY_HEAD_LR": "1e-5"}):
+            cfg = self.experiment.variant_config("metric_no_memory", pilot=True)
+        self.assertEqual(cfg["head_lr"], 1e-5)
+        with patch.dict(os.environ, {"GALLERY_STUDY_HEAD_LR": "0"}):
+            with self.assertRaisesRegex(ValueError, "Invalid microbatch or workers"):
+                self.experiment.variant_config("metric_no_memory", pilot=True)
+
     def test_nonfinite_gallery_score_is_rejected(self):
         scorer = self.method.GalleryScorer(mode="nearest")
         with self.assertRaisesRegex(RuntimeError, "Non-finite gallery"):
