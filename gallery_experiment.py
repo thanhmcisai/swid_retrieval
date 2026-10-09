@@ -404,9 +404,15 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
             torch.autograd.backward(replayed, feature_grad[offset:offset + len(chunk)])
             offset += len(chunk)
     scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group["params"]], 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        [p for group in optimizer.param_groups for p in group["params"]], 1.0)
+    scale_before = float(scaler.get_scale())
     scaler.step(optimizer)
     scaler.update()
+    scale_after = float(scaler.get_scale())
+    details["grad_norm"] = float(grad_norm.detach())
+    details["amp_scale"] = scale_after
+    details["optimizer_step_skipped"] = bool(scaler.is_enabled() and scale_after < scale_before)
     if memory is not None:
         memory.add(embeddings[:n_support], support_labels)
         details["memory_classes"] = len(memory)
@@ -550,7 +556,7 @@ def train_variant(root, out, manifest, cfg, seed, device):
     if cfg["train_backbone"]:
         groups.append({"params": encoder.backbone.parameters(), "lr": cfg["backbone_lr"]})
     optimizer = torch.optim.AdamW(groups, weight_decay=cfg["weight_decay"])
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda", init_scale=1024.0)
     epoch_start, best_score = 1, -float("inf")
     if latest.exists():
         state = torch.load(latest, map_location="cpu", weights_only=False)
@@ -582,13 +588,18 @@ def train_variant(root, out, manifest, cfg, seed, device):
                   f"{len(sampler.eligible)}", flush=True)
         loader = DataLoader(dataset, batch_sampler=sampler, num_workers=cfg["workers"],
                             pin_memory=device.type == "cuda", persistent_workers=cfg["workers"] > 0)
-        losses, top_m_episodes, max_gallery = [], 0, 0
+        losses, top_m_episodes, max_gallery, skipped_steps = [], 0, 0, 0
         for images, batch_labels in loader:
             loss, details = _episode_step(images, batch_labels, cfg, encoder, scorer,
                                           optimizer, scaler, device, classifier, memory)
             losses.append(loss)
             top_m_episodes += int(details.get("top_m_active", False))
             max_gallery = max(max_gallery, details.get("gallery_images", 0))
+            skipped_steps += int(details["optimizer_step_skipped"])
+        if skipped_steps == len(losses):
+            raise RuntimeError(
+                f"All {skipped_steps} optimizer steps were skipped by CUDA AMP in epoch {epoch}; "
+                f"last gradient norm={details['grad_norm']}, loss scale={details['amp_scale']}")
         del loader
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -607,6 +618,7 @@ def train_variant(root, out, manifest, cfg, seed, device):
               f"val{validation['validation_species']}="
               f"{validation['meta_val_r1_all']:.4f} "
               f"topM={top_m_episodes}/{len(losses)} max_gallery={max_gallery} "
+              f"amp_skips={skipped_steps}/{len(losses)} "
               f"train_s={train_seconds:.1f} epoch_s={epoch_seconds:.1f} "
               f"peak_gb={peak_gpu_gb}", flush=True)
         improved = metric > best_score
@@ -629,6 +641,7 @@ def train_variant(root, out, manifest, cfg, seed, device):
                                             "best_score": best_score, "last_validation": validation,
                                             "top_m_episodes": top_m_episodes,
                                             "max_training_gallery_images": max_gallery,
+                                            "amp_skipped_steps": skipped_steps,
                                             "memory_classes": 0 if memory is None else len(memory),
                                             "train_seconds": train_seconds,
                                             "epoch_seconds": epoch_seconds,
@@ -1184,22 +1197,29 @@ def smoke_test(device, real_backbone=False, backbone="dinov2_vitb14"):
         size = 8
     optimizer = torch.optim.AdamW(list(encoder.parameters()) +
                                   [p for p in scorer.parameters() if p.requires_grad], lr=1e-4)
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda", init_scale=1024.0)
     images = torch.randn(12, 3, size, size)
     labels = torch.arange(4).repeat_interleave(2).tolist() + list(range(4))
     watched = next(encoder.backbone.parameters())
     initial = watched.detach().clone()
     memory = GalleryMemory(cfg["memory_size"], cfg["memory_min_classes"])
     memory.add(F.normalize(torch.randn(8, 512), dim=1), torch.arange(4, 12))
-    for _ in range(1 if real_backbone else 2):
+    skipped_steps = 0
+    for _ in range(8):
         loss, details = _episode_step(images, torch.tensor(labels), cfg, encoder, scorer,
                                       optimizer, scaler, device, memory=memory)
         if not np.isfinite(loss):
             raise RuntimeError("Gallery study smoke test returned a non-finite loss")
         if details["top_m_active"]:
             raise RuntimeError("Exact nearest retrieval unexpectedly activated top-M scoring")
-    if torch.equal(initial, watched.detach()):
-        raise RuntimeError("Gallery study smoke test did not update the backbone")
+        skipped_steps += int(details["optimizer_step_skipped"])
+        if not torch.equal(initial, watched.detach()):
+            break
+    else:
+        raise RuntimeError(
+            f"Gallery study smoke test did not update the backbone after 8 attempts; "
+            f"AMP skipped {skipped_steps}, last gradient norm={details['grad_norm']}, "
+            f"loss scale={details['amp_scale']}")
     print(f"[gallery] {backbone if real_backbone else 'synthetic'} smoke test passed "
-          f"on {device}; final loss={loss:.4f}", flush=True)
+          f"on {device}; final loss={loss:.4f}, amp_skips={skipped_steps}", flush=True)
     return loss

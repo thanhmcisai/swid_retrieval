@@ -160,6 +160,11 @@ os.environ["GALLERY_STUDY_MODE"] = "backbone_smoke"
 _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 ```
 
+Smoke tests retry initial CUDA AMP skipped steps and report `amp_skips`; a
+failure after eight attempts reports the last gradient norm and loss scale.
+Training logs and `progress.json` also record skipped optimizer steps. Do not
+interpret an epoch with every optimizer step skipped as successful training.
+
 Set `GALLERY_STUDY_BACKBONE` to `dinov2_vits14`, `convnext_tiny`, or
 `dinov2_vitb14` and repeat the backbone smoke test before training each
 control. The corresponding pretrained weights are fetched on the first use.

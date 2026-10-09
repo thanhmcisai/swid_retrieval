@@ -2,6 +2,7 @@
 
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 
 DEPS = all(importlib.util.find_spec(name) is not None for name in
@@ -135,6 +136,42 @@ class GalleryMethodTest(unittest.TestCase):
 
     def test_synthetic_full_backbone_step(self):
         self.experiment.smoke_test(self.torch.device("cpu"))
+
+    def test_smoke_retries_after_amp_skips(self):
+        torch = self.torch
+
+        class SkippingScaler:
+            def __init__(self, *args, **kwargs):
+                self.remaining = 2
+                self.scale_value = 1024.0
+                self.skipped = False
+
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, optimizer):
+                pass
+
+            def step(self, optimizer):
+                self.skipped = self.remaining > 0
+                if self.skipped:
+                    self.remaining -= 1
+                else:
+                    optimizer.step()
+
+            def update(self):
+                if self.skipped:
+                    self.scale_value /= 2
+
+            def get_scale(self):
+                return self.scale_value
+
+            def is_enabled(self):
+                return True
+
+        with patch.object(torch.amp, "GradScaler", SkippingScaler, create=True):
+            loss = self.experiment.smoke_test(torch.device("cpu"))
+        self.assertTrue(self.np.isfinite(loss))
 
 
 if __name__ == "__main__":
