@@ -133,6 +133,57 @@ different numbers of competitor classes. If validation stays near chance for
 both, stop and revisit the scratch-encoder training recipe rather than adding
 epochs or choosing a checkpoint on public test results.
 
+## Supervised warm-up of the custom encoder
+
+The scratch WoodPatternNet/no-memory pilot had substantially lower scan-disjoint
+meta-validation retrieval than a frozen DINOv2 control under both nearest and
+prototype scoring. Before another long metric run, use an isolated supervised
+warm-up on **meta-train only**. This stage trains the custom encoder, its
+projection, and a temporary 557-way classifier with cross-entropy. Per-image
+sampling uses inverse-square-root species-frequency weights. The classifier is
+discarded after warm-up; `best.pt` is selected by nearest-image retrieval on
+the same scan-disjoint meta-val protocol. No public images are read.
+
+```python
+os.environ.update({
+    "RUN_GALLERY_STUDY": "1",
+    "RUN_REPAIR_PUBLIC_ROWS": "0",
+    "RUN_FINAL_SCURD_RETRAIN": "0",
+    "RUN_FINAL_COLAB_AUDIT": "0",
+    "GALLERY_STUDY_MODE": "warmup",
+    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/woodpattern_warmup_pilot",
+    "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
+    "GALLERY_STUDY_VARIANTS": "supervised_warmup",
+    "GALLERY_STUDY_SEEDS": "42",
+    "GALLERY_STUDY_WARMUP_EPOCHS": "5",
+    "GALLERY_STUDY_WARMUP_STEPS": "300",
+    "GALLERY_STUDY_WARMUP_BATCH": "64",
+    "GALLERY_STUDY_WARMUP_LR": "5e-4",
+    "GALLERY_STUDY_PRELOAD": "0",
+    "GALLERY_STUDY_PILOT_CHECKPOINTS": "0",
+    "GALLERY_STUDY_INIT_CHECKPOINT": "",
+})
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+```
+
+Set `GALLERY_STUDY_PRELOAD=1` if the Colab runtime restarted and its local
+`/content/cache_images` no longer contains the SmartWoodID images.
+
+Inspect `val24`, `val57`, `ref_spread`, training accuracy, and AMP skips before
+fine-tuning. Do not assume warm-up is successful because training accuracy
+increases. `best_validation.json` records the selected epoch without loading
+the PyTorch checkpoint. If it is clearly better than the previous no-memory best
+(`val24=0.0917`, `val57=0.0456`) but still below the frozen DINOv2 nearest
+control (`0.2417`, `0.2456`), it remains an exploratory candidate, not a
+superior method. If it does not improve meta-val, stop here.
+
+For a subsequent **separate** metric pilot, set `GALLERY_STUDY_MODE=train`,
+`GALLERY_STUDY_VARIANTS=metric_no_memory`, and
+`GALLERY_STUDY_INIT_CHECKPOINT` to the warm-up `best.pt`. Use a new
+`GALLERY_STUDY_OUT` so the uninitialized checkpoints are never reused. The
+runner checks the warm-up seed, backbone, embedding dimension, manifest hash,
+and checkpoint file hash before training.
+
 ## Colab setup
 
 Use a GPU runtime. Mount Drive and ensure `swi_manifest.json`, the corrected

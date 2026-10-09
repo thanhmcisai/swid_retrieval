@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.nn import functional as F
-from torch.utils.data import BatchSampler, DataLoader
+from torch.utils.data import BatchSampler, DataLoader, WeightedRandomSampler
 
 from . import data
 from .gallery_method import (ArcFaceClassifier, GalleryEncoder, GalleryMemory, GalleryScorer,
@@ -33,6 +33,8 @@ BACKBONES = ("dinov2_vitb14", "dinov2_vits14", "convnext_tiny",
 VARIANTS = {
     "dinov2_pretrained": {"objective": "pretrained", "embedding_dim": 768,
                            "train_backbone": False, "scorer_mode": "prototype"},
+    "supervised_warmup": {"objective": "supervised_warmup", "scorer_mode": "nearest",
+                          "memory_size": 0, "memory_min_classes": 0},
     "metric_retrieval": {"scorer_mode": "nearest", "variable_gallery": False,
                          "stability_weight": 0.0, "pseudo_ood_weight": 0.0},
     "metric_no_memory": {"scorer_mode": "nearest", "variable_gallery": False,
@@ -182,10 +184,27 @@ def variant_config(name, *, pilot=False):
         "objective": "episode",
     }
     config.update(VARIANTS[name])
+    if config["objective"] == "supervised_warmup":
+        config.update({
+            "warmup_epochs": int(os.environ.get("GALLERY_STUDY_WARMUP_EPOCHS", "5")),
+            "warmup_steps": int(os.environ.get("GALLERY_STUDY_WARMUP_STEPS", "300")),
+            "warmup_batch": int(os.environ.get("GALLERY_STUDY_WARMUP_BATCH", "64")),
+            "warmup_lr": float(os.environ.get("GALLERY_STUDY_WARMUP_LR", "5e-4")),
+        })
+    init_path = os.environ.get("GALLERY_STUDY_INIT_CHECKPOINT", "").strip()
+    if init_path and config["objective"] not in {"pretrained", "supervised_warmup"}:
+        config["init_checkpoint"] = str(Path(init_path).resolve())
+        config["init_checkpoint_sha256"] = _hash_file(init_path)
     if config["backbone"] not in BACKBONES:
         raise ValueError(f"Unknown backbone {config['backbone']}; choose from {BACKBONES}")
     if config["objective"] == "pretrained" and config["backbone"] != "dinov2_vitb14":
         raise ValueError("The pretrained 768-dimensional control requires dinov2_vitb14")
+    if config["objective"] == "supervised_warmup":
+        if not config["backbone"].startswith("woodpattern_"):
+            raise ValueError("Supervised warm-up currently supports WoodPatternNet only")
+        if (config["warmup_epochs"] < 1 or config["warmup_steps"] < 1 or
+                config["warmup_batch"] < 2 or config["warmup_lr"] <= 0):
+            raise ValueError("Invalid supervised warm-up schedule")
     if (config["microbatch"] < 1 or config["workers"] < 0 or
             config["epochs"] < 1 or config["episodes_per_epoch"] < 1 or
             config["backbone_lr"] <= 0 or config["head_lr"] <= 0):
@@ -503,7 +522,7 @@ def _validation(encoder, scorer, manifest, cfg, device):
             "reference_embedding_spread": reference_spread,
             "validation_species": len(set(ref_labels)),
             "group_mode": cfg["group_mode"],
-            "small_gallery_species": sorted(subset),
+            "small_gallery_species": [str(label) for label in sorted(subset)],
             "validation_reference_images": len(reference_items), "validation_query_images": len(probe_items)}
 
 
@@ -525,6 +544,155 @@ def _run_signature(root, cfg, seed):
     return _hash_bytes(json.dumps(payload, sort_keys=True).encode())
 
 
+def _supervised_step(images, labels, encoder, classifier, optimizer, scaler, device):
+    optimizer.zero_grad(set_to_none=True)
+    encoder.train()
+    classifier.train()
+    with _autocast(device):
+        features = encoder.backbone(images.to(device, non_blocking=True))
+    with torch.autocast(device_type=device.type, enabled=False):
+        projected = encoder.projection(features.float())
+        logits = classifier(projected)
+        loss = F.cross_entropy(logits, labels.to(device, non_blocking=True))
+    if not torch.isfinite(loss):
+        raise RuntimeError("Non-finite supervised warm-up loss; checkpoint was not advanced")
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+    scale_before = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    skipped = bool(scaler.is_enabled() and float(scaler.get_scale()) < scale_before)
+    return {"loss": float(loss.detach()),
+            "accuracy": float((logits.argmax(1) == labels.to(device)).float().mean().detach()),
+            "grad_norm": float(grad_norm.detach()), "amp_skipped": skipped}
+
+
+def train_supervised_warmup(root, out, manifest, cfg, seed, device):
+    if cfg["objective"] != "supervised_warmup":
+        raise ValueError("Expected supervised_warmup variant")
+    _seed(seed)
+    run_dir = out / cfg["backbone"] / cfg["variant"] / f"seed_{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    signature = _run_signature(root, cfg, seed)
+    manifest_sha256 = _hash_file(root / "swi_manifest.json")
+    latest, best = run_dir / "latest.pt", run_dir / "best.pt"
+    train_items = [(path, canonical(label)) for path, label in manifest["meta-train"]]
+    if os.environ.get("GALLERY_STUDY_PRELOAD", "0") == "1":
+        val_refs, val_queries = validation_items(manifest, group_mode=cfg["group_mode"])
+        data.preload_image_cache(
+            [path for path, _ in train_items + val_refs + val_queries],
+            max_workers=int(os.environ.get("GALLERY_STUDY_PRELOAD_WORKERS", "16")),
+            desc="Gallery study supervised warm-up images")
+    dataset = data.ManifestDataset(
+        train_items, transform=data.get_transforms(cfg["image_size"], augment=True))
+    labels = torch.tensor(dataset.get_labels(), dtype=torch.long)
+    counts = torch.bincount(labels, minlength=len(dataset.class_to_idx)).float()
+    sample_weights = counts[labels].rsqrt()
+    encoder, scorer = _model(cfg, device, pretrained=False)
+    classifier = torch.nn.Linear(cfg["embedding_dim"], len(dataset.class_to_idx)).to(device)
+    initial_backbone_sha256 = _state_sha256(encoder.backbone)
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) + list(classifier.parameters()),
+        lr=cfg["warmup_lr"], weight_decay=cfg["weight_decay"])
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda", init_scale=1024.0)
+    epoch_start, best_score = 1, -float("inf")
+    if latest.exists():
+        state = torch.load(latest, map_location="cpu", weights_only=False)
+        if (state["signature"] != signature or
+                state["initial_backbone_sha256"] != initial_backbone_sha256):
+            raise ValueError(f"Supervised warm-up provenance changed at {latest}")
+        encoder.load_state_dict(state["encoder"])
+        classifier.load_state_dict(state["classifier"])
+        optimizer.load_state_dict(state["optimizer"])
+        scaler.load_state_dict(state["scaler"])
+        _restore_rng(state["rng_state"])
+        epoch_start = int(state["epoch"]) + 1
+        best_score = float(state["best_score"])
+        print(f"[gallery] Resuming supervised warm-up seed={seed} at epoch {epoch_start}", flush=True)
+    print(f"[gallery] supervised warm-up: {len(dataset.class_to_idx)} meta-train species, "
+          f"{cfg['warmup_steps']} steps/epoch, batch={cfg['warmup_batch']}", flush=True)
+    for epoch in range(epoch_start, cfg["warmup_epochs"] + 1):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        start = time.perf_counter()
+        generator = torch.Generator().manual_seed(seed + epoch * 100003)
+        sampler = WeightedRandomSampler(
+            sample_weights, num_samples=cfg["warmup_steps"] * cfg["warmup_batch"],
+            replacement=True, generator=generator)
+        loader = DataLoader(dataset, batch_size=cfg["warmup_batch"], sampler=sampler,
+                            num_workers=cfg["workers"], pin_memory=device.type == "cuda",
+                            persistent_workers=cfg["workers"] > 0)
+        steps = [_supervised_step(images, labels, encoder, classifier, optimizer, scaler, device)
+                 for images, labels in loader]
+        del loader
+        skipped_steps = sum(step["amp_skipped"] for step in steps)
+        if skipped_steps == len(steps):
+            raise RuntimeError("Every supervised warm-up optimizer step was skipped")
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_seconds = time.perf_counter() - start
+        validation = _validation(encoder, scorer, manifest, cfg, device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        peak_gb = (torch.cuda.max_memory_allocated(device) / 1024**3
+                   if device.type == "cuda" else None)
+        metric = float(validation["selection_score"])
+        if not np.isfinite(metric):
+            raise RuntimeError("Non-finite supervised warm-up validation score")
+        print(f"[gallery] supervised_warmup seed={seed} epoch={epoch}/{cfg['warmup_epochs']} "
+              f"loss={np.mean([step['loss'] for step in steps]):.4f} "
+              f"train_acc={np.mean([step['accuracy'] for step in steps]):.4f} "
+              f"val24={validation['meta_val_r1_24']:.4f} "
+              f"val{validation['validation_species']}={validation['meta_val_r1_all']:.4f} "
+              f"ref_spread={validation['reference_embedding_spread']:.4f} "
+              f"amp_skips={skipped_steps}/{len(steps)} "
+              f"train_s={train_seconds:.1f} peak_gb={peak_gb}", flush=True)
+        improved = metric > best_score
+        best_score = max(best_score, metric)
+        payload = {"checkpoint_kind": "supervised_warmup", "signature": signature,
+                   "manifest_sha256": manifest_sha256, "config": cfg, "seed": seed,
+                   "epoch": epoch, "best_score": best_score, "validation": validation,
+                   "initial_backbone_sha256": initial_backbone_sha256,
+                   "encoder": encoder.state_dict(), "classifier": classifier.state_dict(),
+                   "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
+                   "rng_state": _rng_state()}
+        if improved:
+            _save_checkpoint(best, {key: payload[key] for key in (
+                "checkpoint_kind", "signature", "manifest_sha256", "config", "seed", "epoch",
+                "best_score", "validation", "initial_backbone_sha256", "encoder", "classifier")})
+            _json(run_dir / "best_validation.json", {"signature": signature, "epoch": epoch,
+                                                       "validation": validation})
+        _save_checkpoint(latest, payload)
+        _json(run_dir / "progress.json", {
+            "signature": signature, "epoch": epoch, "best_score": best_score,
+            "last_validation": validation, "mean_loss": float(np.mean([step["loss"] for step in steps])),
+            "train_accuracy": float(np.mean([step["accuracy"] for step in steps])),
+            "amp_skipped_steps": skipped_steps, "train_seconds": train_seconds,
+            "peak_gpu_memory_gb": peak_gb})
+    return best
+
+
+def _load_warmup_encoder(root, cfg, seed, encoder):
+    path = cfg.get("init_checkpoint")
+    if not path:
+        return
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    source_cfg = state.get("config", {})
+    if (state.get("checkpoint_kind") != "supervised_warmup" or
+            state.get("manifest_sha256") != _hash_file(root / "swi_manifest.json") or
+            source_cfg.get("backbone") != cfg["backbone"] or
+            source_cfg.get("embedding_dim") != cfg["embedding_dim"] or
+            state.get("seed") != seed):
+        raise ValueError(f"Warm-up checkpoint is not aligned with this metric run: {path}")
+    if _hash_file(path) != cfg["init_checkpoint_sha256"]:
+        raise ValueError(f"Warm-up checkpoint changed after configuration: {path}")
+    encoder.load_state_dict(state["encoder"], strict=True)
+    print(f"[gallery] Initialized {cfg['variant']} seed={seed} from supervised warm-up "
+          f"epoch {state['epoch']} ({Path(path).name})", flush=True)
+
+
 def train_variant(root, out, manifest, cfg, seed, device):
     _seed(seed)
     run_dir = out / cfg["backbone"] / cfg["variant"] / f"seed_{seed}"
@@ -544,6 +712,7 @@ def train_variant(root, out, manifest, cfg, seed, device):
                     if cfg["group_mode"] == "scan_disjoint" else None)
     _seed(seed)
     encoder, scorer = _model(cfg, device)
+    _load_warmup_encoder(root, cfg, seed, encoder)
     initial_backbone_sha256 = _state_sha256(encoder.backbone)
     print(f"[gallery] backbone={cfg['backbone']} params="
           f"{sum(p.numel() for p in encoder.backbone.parameters()):,} "
@@ -663,6 +832,8 @@ def train_variant(root, out, manifest, cfg, seed, device):
                 "signature", "config", "seed", "epoch", "best_score", "validation",
                 "initial_backbone_sha256",
                 "encoder", "scorer", "classifier")})
+            _json(run_dir / "best_validation.json", {"signature": signature, "epoch": epoch,
+                                                       "validation": validation})
         _save_checkpoint(latest, payload)
         _json(run_dir / "progress.json", {"signature": signature, "epoch": epoch,
                                             "best_score": best_score, "last_validation": validation,
@@ -1093,8 +1264,9 @@ def run():
     root = Path(os.environ.get("ROOT_PATH", "/content/drive/MyDrive/NCS")).resolve()
     out = Path(os.environ.get("GALLERY_STUDY_OUT", root / "results" / "metric_retrieval_study")).resolve()
     mode = os.environ.get("GALLERY_STUDY_MODE", "pilot").lower()
-    if mode not in {"smoke", "backbone_smoke", "preflight", "pilot", "train", "evaluate"}:
-        raise ValueError("GALLERY_STUDY_MODE must be smoke, backbone_smoke, preflight, pilot, train, or evaluate")
+    if mode not in {"smoke", "backbone_smoke", "preflight", "pilot", "warmup", "train", "evaluate"}:
+        raise ValueError("GALLERY_STUDY_MODE must be smoke, backbone_smoke, preflight, pilot, "
+                         "warmup, train, or evaluate")
     device = torch.device("cuda" if os.environ.get("DEVICE", "cuda") == "cuda" and
                           torch.cuda.is_available() else "cpu")
     if mode == "smoke":
@@ -1104,16 +1276,21 @@ def run():
             raise RuntimeError("Backbone smoke test requires CUDA")
         backbone = os.environ.get("GALLERY_STUDY_BACKBONE", "dinov2_vitb14").lower()
         return smoke_test(device, real_backbone=True, backbone=backbone)
-    if device.type != "cuda" and mode in {"pilot", "train"}:
+    if device.type != "cuda" and mode in {"pilot", "warmup", "train"}:
         raise RuntimeError("Full-backbone training requires a CUDA runtime")
     pilot = mode == "pilot" or os.environ.get("GALLERY_STUDY_PILOT_CHECKPOINTS", "0") == "1"
-    default_variants = "metric_retrieval,prototype_retrieval" if mode == "pilot" else "metric_retrieval"
+    default_variants = ("supervised_warmup" if mode == "warmup" else
+                        "metric_retrieval,prototype_retrieval" if mode == "pilot" else
+                        "metric_retrieval")
     variants = [name.strip() for name in os.environ.get("GALLERY_STUDY_VARIANTS", default_variants).split(",")]
     seeds = [int(x.strip()) for x in os.environ.get("GALLERY_STUDY_SEEDS", "42" if mode == "pilot" else "42,43,44").split(",")]
     if any(name not in VARIANTS for name in variants) or len(set(variants)) != len(variants):
         raise ValueError(f"Invalid or duplicate variant in {variants}; allowed: {sorted(VARIANTS)}")
     if not variants or not seeds:
         raise ValueError("At least one variant and seed are required")
+    if (mode == "warmup" and variants != ["supervised_warmup"]) or (
+            mode != "warmup" and "supervised_warmup" in variants):
+        raise ValueError("supervised_warmup must run alone in warmup mode")
     manifest = data.load_swi_manifest(root / "swi_manifest.json")
     expected_splits = {"meta-train": (124577, 557), "meta-val": (18018, 80),
                        "meta-test": (33528, 317)}
@@ -1148,7 +1325,9 @@ def run():
     for variant in variants:
         cfg = variant_config(variant, pilot=pilot)
         for seed in seeds:
-            if mode in {"pilot", "train"}:
+            if mode == "warmup":
+                train_supervised_warmup(root, out, manifest, cfg, seed, device)
+            elif mode in {"pilot", "train"}:
                 train_variant(root, out, manifest, cfg, seed, device)
             else:
                 reports.append(evaluate_variant(
