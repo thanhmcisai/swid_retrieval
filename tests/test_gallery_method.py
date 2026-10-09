@@ -39,9 +39,25 @@ class GalleryMethodTest(unittest.TestCase):
             scorer, np.asarray([[1., 0.], [0., 1.]], dtype=np.float32),
             np.asarray(["a", "b"]), gallery, np.asarray(["a", "a", "b", "b"]),
             torch.device("cpu"))
-        self.assertEqual(result["gallery_adaptive_r1"], 1.0)
+        self.assertEqual(result["species_r1"], 1.0)
         self.assertEqual(result["image_map_at_100"], 1.0)
         self.assertEqual(result["image_mrr_at_100"], 1.0)
+
+    def test_primary_variant_uses_exact_nearest_retrieval(self):
+        np, torch = self.np, self.torch
+        cfg = self.experiment.variant_config("metric_retrieval", pilot=True)
+        self.assertEqual(cfg["scorer_mode"], "nearest")
+        self.assertFalse(cfg["variable_gallery"])
+        self.assertEqual(cfg["stability_weight"], 0.0)
+        self.assertEqual(cfg["pseudo_ood_weight"], 0.0)
+        scorer = self.method.GalleryScorer(mode="nearest", top_m=1)
+        gallery = np.asarray([[1., 0.], [0., 1.], [-1., 0.]], dtype=np.float32)
+        queries = np.asarray([[1., 0.], [0., 1.]], dtype=np.float32)
+        result = self.experiment._predict(
+            scorer, queries, np.asarray(["a", "b"]), gallery,
+            np.asarray(["a", "b", "c"]), torch.device("cpu"))
+        self.assertEqual(result["species_r1"], result["nearest_image_r1"])
+        self.assertEqual(len(scorer.state_dict()), 0)
 
     def test_variable_gallery_loss_reaches_encoder_features(self):
         torch = self.torch

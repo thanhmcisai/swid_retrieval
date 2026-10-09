@@ -10,6 +10,44 @@ except ImportError:
 
 @unittest.skipUnless(torch is not None, "PyTorch unavailable")
 class WoodGalleryTest(unittest.TestCase):
+    def test_nearest_scorer_matches_exact_image_retrieval(self):
+        from swid_retrieval.gallery_method import GalleryScorer
+        references = torch.nn.functional.normalize(torch.tensor([
+            [1., 0.], [0.8, 0.2], [0., 1.], [-1., 0.]]), dim=1)
+        labels = torch.tensor([5, 5, 2, 9])
+        queries = torch.nn.functional.normalize(torch.tensor([
+            [1., 0.], [0., 1.], [-1., 0.]]), dim=1)
+        scorer = GalleryScorer(top_m=1, mode="nearest")
+        scores, classes = scorer(queries, references, labels)
+        cached, cached_classes = scorer(queries, references, labels,
+                                        similarity=queries @ references.T)
+        expected = torch.stack([
+            (queries @ references[labels == cls].T).amax(dim=1) / scorer.temperature
+            for cls in classes], dim=1)
+        self.assertTrue(torch.allclose(scores, expected))
+        self.assertTrue(torch.allclose(cached, scores))
+        self.assertTrue(torch.equal(cached_classes, classes))
+        self.assertEqual(classes[scores.argmax(dim=1)].tolist(), [5, 2, 9])
+        self.assertFalse(any(param.requires_grad for param in scorer.parameters()))
+
+    def test_metric_retrieval_uses_only_gallery_ce_and_backpropagates(self):
+        from swid_retrieval.gallery_method import GalleryScorer, episode_objective
+        vectors = torch.nn.functional.normalize(torch.randn(12, 16), dim=1)
+        vectors.requires_grad_()
+        scorer = GalleryScorer(mode="nearest")
+        loss, parts = episode_objective(vectors, scorer, 4, 2, 1,
+                                        stability_weight=0.0,
+                                        use_variable_gallery=False,
+                                        pseudo_ood_weight=0.0)
+        reference_labels = torch.arange(4).repeat_interleave(2)
+        scores, _ = scorer(vectors[8:], vectors[:8], reference_labels)
+        expected = torch.nn.functional.cross_entropy(scores, torch.arange(4))
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertFalse(parts["top_m_active"])
+        self.assertNotIn("old_ce", parts)
+        loss.backward()
+        self.assertGreater(float(vectors.grad.abs().sum()), 0)
+
     def test_wood_backbone_shapes_and_gradient(self):
         from swid_retrieval.wood_encoder import WoodPatternNet
         from swid_retrieval.gallery_method import GalleryEncoder

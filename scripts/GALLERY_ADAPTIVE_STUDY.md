@@ -1,4 +1,4 @@
-# Gallery-adaptive end-to-end study (separate from the manuscript run)
+# End-to-end metric retrieval study (separate from the manuscript run)
 
 This is a prospective method experiment, not an update to the submitted
 numbers. Choose a pretrained DINOv2 ViT-B/14 or ViT-S/14, a pretrained
@@ -11,6 +11,17 @@ gradient replay trains the whole backbone on a 16 GB T4. The backbone is
 **not frozen** except for the named ablation. Initial backbone tensor hashes,
 code hashes, checkpoint selection and exact config are recorded.
 
+The primary variant is `metric_retrieval`: train the image encoder and its
+embedding projection end-to-end with cross-entropy over the species represented
+in an episode gallery. At inference, each class score is the **exact maximum
+cosine similarity to any reference image of that class**. There is no trained
+post-embedding scoring network; the optional gate is absent from its checkpoint.
+`prototype_retrieval` is a nonparametric
+prototype control. `metric_expansion` adds old-gallery and expansion/OOD
+margins to the same nearest-image scorer. `gallery_adaptive` retains the
+learned evidence gate only as an ablation. The historical SC-URD pipeline and
+the existing manuscript are not modified by this study.
+
 ## Protocol
 
 - Train on SmartWoodID `meta-train` only. Recover original scan IDs from
@@ -21,28 +32,34 @@ code hashes, checkpoint selection and exact config are recorded.
   approximately 57/80 validation species have at least two scans; the
   preflight reports the actual patch-derived count. Public images are never
   used to select weights or hyperparameters.
-- The training objective contrasts an old-only, one-shot gallery with an
-  expanded, multi-shot gallery containing new species. It includes an explicit
-  old-species expansion margin. New-episode species act as pseudo-OOD queries
-  against the old gallery for a separate distance-margin loss; no public OOD
-  labels enter training. Genus-related negatives can be sampled from
-  training labels. The learned scorer combines prototypes with per-class
-  nearest and count-normalized log-mean-exp evidence. Every gallery class has
-  prototype fallback even when absent from the global top-M image candidates.
+- `metric_retrieval` optimizes only gallery-conditioned species cross-entropy
+  over exact nearest-reference scores. `metric_expansion` additionally contrasts
+  old-only and expanded galleries, with an old-species margin and a pseudo-OOD
+  distance margin. New-episode species supply pseudo-OOD queries; no public
+  OOD images enter training. Genus-related negatives can be sampled from
+  training labels. The learned gate in `gallery_adaptive` combines prototype,
+  nearest and count-normalized top-M evidence, but is not part of the primary
+  method.
 - Each episode has 4/8/16 active classes and two live support images per class.
   A FIFO memory of up to 256 **detached meta-train class prototypes** adds
-  distractor species after 80 distinct classes have been seen. Thus the
-  primary 64-image candidate cap actually activates during training. Current
-  support/query images and the backbone retain gradients; stale memory
-  prototypes do not. Training logs show `topM` episodes and maximum gallery
-  size. This is an approximation to larger galleries, not a full gradient
+  distractor species after 80 distinct classes have been seen. The primary
+  nearest-reference method considers every current support and memory vector;
+  `top_m` does not apply to it. Current support/query images and the backbone
+  retain gradients; stale memory prototypes do not. Training logs show the
+  maximum gallery size and report `topM=0` for exact nearest retrieval.
+  This is an approximation to larger galleries, not a full gradient
   through all 954 reference classes; meta-train contains 557 species, fewer
   of which have two or more source scans.
-- `fixed_episode`, `without_expansion_loss`, `without_pseudo_ood`, `without_hard_negatives`,
+- `metric_expansion` isolates the effect of old-gallery and margin losses
+  while keeping exact nearest retrieval. `gallery_adaptive`, `fixed_episode`,
+  `without_expansion_loss`, `without_pseudo_ood`, `without_hard_negatives`,
   `prototype_only`, `fixed_evidence`, `without_count_normalization`,
   `without_memory`, `memory_512`, `top_m_32`, `top_m_128`, `frozen_encoder` are
-  ablations. The `top_m_128` experiment warms up to 160 memory classes so
-  truncation can be exercised. `woodpattern_no_attention` and
+  mostly ablations of the learned-scorer family; `without_memory` and
+  `frozen_encoder` also apply to the primary method when configured explicitly.
+  The
+  `top_m_128` experiment warms up to 160 memory classes so truncation can be
+  exercised. `woodpattern_no_attention` and
   `woodpattern_single_scale` isolate the custom encoder's key components.
   `supcon_finetuned` and `arcface_finetuned` train the *same* selected
   backbone/embedding size on the same episodes and 224-pixel images. SupCon
@@ -57,7 +74,7 @@ code hashes, checkpoint selection and exact config are recorded.
   rows are reused; missing vectors are extracted and cached separately.
   Each main gallery result reports class macro R@1 and image-embedding macro
   mAP@100/MRR@100. The latter are truncated image rankings, not full-gallery
-  mAP, and are not the objective optimized by the class scorer. AP@100 uses
+  mAP, and are not the objective optimized by species cross-entropy. AP@100 uses
   `min(number of relevant gallery images, 100)` as its denominator and is
   macro-averaged over query species.
 - Public data and earlier versions of this benchmark have already informed
@@ -75,17 +92,20 @@ code hashes, checkpoint selection and exact config are recorded.
   depict the same wood specimen. Public K-shot specimen IDs are unavailable,
   so that split is also unverified at the specimen level. The evaluation
   JSON marks this limitation. Pooled OOD uses nearest-image distance, not
-  the learned class scorer; do not attribute its AUROC gain to the scorer.
+  class scoring; do not attribute its AUROC gain to the learned gate.
 
 ## Colab setup
 
 Use a GPU runtime. Mount Drive and ensure `swi_manifest.json`, the corrected
 `ID_images_expanded.csv` and `OOD_images_expanded.csv`, and
 `embedding_cache_full954_v6_public_row_verified.npz` exist under the root.
-The study writes only to `results/gallery_adaptive_study_*` by default; it
+Use a new `results/metric_retrieval_study_*` output directory; it
 does not overwrite the paper cache or figures. Install the project's existing
 dependencies, including `torch`, `torchvision`, `numpy`, `pandas`, `opencv-python`,
 `albumentations`, `scikit-learn`, and `timm` if the Colab runtime lacks them.
+Do not point this code at checkpoints or `evaluation.json` from the earlier
+gallery study: the model and result schemas changed, and the runner checks
+their code hashes.
 
 Run this setup cell once (or again after a `git pull`):
 
@@ -107,7 +127,7 @@ os.environ.update({
     "RUN_REPAIR_PUBLIC_ROWS": "0",
     "RUN_FINAL_SCURD_RETRAIN": "0",
     "RUN_FINAL_COLAB_AUDIT": "0",
-    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/gallery_adaptive_study_full",
+    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/metric_retrieval_study_full",
     "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
     "GALLERY_STUDY_WORKERS": "4",
     "GALLERY_STUDY_MICROBATCH": "8",
@@ -150,9 +170,9 @@ pilot's two-epoch checkpoints must not be passed off as the final model:
 ```python
 os.environ.update({
     "GALLERY_STUDY_MODE": "pilot",
-    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/gallery_adaptive_study_pilot",
+    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/metric_retrieval_study_pilot",
     "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
-    "GALLERY_STUDY_VARIANTS": "gallery_adaptive,without_memory,top_m_128",
+    "GALLERY_STUDY_VARIANTS": "metric_retrieval,prototype_retrieval",
     "GALLERY_STUDY_SEEDS": "42",
     "GALLERY_STUDY_PRELOAD": "0",
 })
@@ -167,14 +187,15 @@ On a cold `/content/cache_images`, use `GALLERY_STUDY_PRELOAD=1` once to
 move the training/validation images from Drive; the initial copy takes time
 but avoids repeatedly waiting on Drive during every episode. Compare
 `train_s`, `epoch_s`, and `peak_gb` only after this one-time preload.
-Inspect `progress.json`: `top_m_episodes` must be nonzero after memory
-warmup. If it stays zero, do not interpret the pilot as a test of top-M
-gallery training. Repeat a short pilot with `dinov2_vits14` and
+Inspect `progress.json`: `max_training_gallery_images` should grow after memory
+warmup. `top_m_episodes=0` is expected for exact nearest retrieval, not a
+failure. For the learned-scorer ablation, the cap should activate after
+memory warmup. Repeat a short pilot with `dinov2_vits14` and
 `convnext_tiny` by changing only `GALLERY_STUDY_BACKBONE`. Training/evaluation
 outputs are namespaced by backbone, variant, and seed. All comparisons must
 use the same image resolution, meta-train split, and evaluation protocol.
 
-For full training, use the `gallery_adaptive_study_full` output directory.
+For full training, use the `metric_retrieval_study_full` output directory.
 Train one configuration at a time so each epoch checkpoint can be resumed
 after a disconnect. Begin with the custom-backbone candidate across three
 seeds **only if its pilot is stable**:
@@ -182,8 +203,8 @@ seeds **only if its pilot is stable**:
 ```python
 os.environ.update({
     "GALLERY_STUDY_MODE": "train",
-    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/gallery_adaptive_study_full",
-    "GALLERY_STUDY_VARIANTS": "gallery_adaptive",
+    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/metric_retrieval_study_full",
+    "GALLERY_STUDY_VARIANTS": "metric_retrieval",
     "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
     "GALLERY_STUDY_SEEDS": "42,43,44",
     "GALLERY_STUDY_PRELOAD": "1",
@@ -191,14 +212,16 @@ os.environ.update({
 _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 ```
 
-For architecture controls, keep `GALLERY_STUDY_VARIANTS=gallery_adaptive`
+For architecture controls, keep `GALLERY_STUDY_VARIANTS=metric_retrieval`
 and change `GALLERY_STUDY_BACKBONE` to `woodpattern_no_attention`,
 `woodpattern_single_scale`, `dinov2_vits14`, `convnext_tiny`, and
 `dinov2_vitb14`. For loss/scorer ablations, restore `woodpattern_tiny`, then
 change `GALLERY_STUDY_VARIANTS` to each of these and rerun the same cell:
-`fixed_episode`, `without_expansion_loss`, `without_pseudo_ood`, `without_hard_negatives`,
-`prototype_only`, `fixed_evidence`, `without_count_normalization`,
-`without_memory`, `memory_512`, `top_m_32`, `top_m_128`, `frozen_encoder`,
+`prototype_retrieval`, `metric_expansion`, `gallery_adaptive`,
+`fixed_episode`, `without_expansion_loss`, `without_pseudo_ood`,
+`without_hard_negatives`, `prototype_only`, `fixed_evidence`,
+`without_count_normalization`, `without_memory`, `memory_512`, `top_m_32`,
+`top_m_128`, `frozen_encoder`,
 `supcon_finetuned`, `arcface_finetuned`. `dinov2_pretrained` requires
 `dinov2_vitb14`. Use seed 42 for screening; repeat configurations needed
 for the final claim with seeds 43 and 44. A full grid is a large GPU study,
@@ -213,7 +236,7 @@ selection as training:
 os.environ.update({
     "GALLERY_STUDY_MODE": "evaluate",
     "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
-    "GALLERY_STUDY_VARIANTS": "gallery_adaptive,without_memory,top_m_128",
+    "GALLERY_STUDY_VARIANTS": "metric_retrieval,prototype_retrieval,metric_expansion,gallery_adaptive",
     "GALLERY_STUDY_SEEDS": "42",
     "GALLERY_STUDY_PRELOAD": "0",
     "GALLERY_STUDY_KSHOT_REPEATS": "30",

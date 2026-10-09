@@ -84,16 +84,15 @@ class GalleryMemory:
 
 
 class GalleryScorer(nn.Module):
-    """One score per class from its prototype and globally retrieved evidence.
+    """One score per class from exact nearest-image or aggregated evidence.
 
-    Unlike an uncorrected log-sum-exp, the evidence term is divided by the
-    number of retrieved references for that class. Classes absent from the
-    global candidate set retain their prototype score.
+    In learned/fixed modes, evidence is count-normalized; classes absent from
+    global top-M image candidates retain their prototype score.
     """
 
     def __init__(self, top_m=64, temperature=0.07, mode="learned", normalize_evidence=True):
         super().__init__()
-        if mode not in {"learned", "prototype", "fixed"}:
+        if mode not in {"learned", "prototype", "fixed", "nearest"}:
             raise ValueError(f"Unknown scoring mode: {mode}")
         self.top_m = int(top_m)
         self.temperature = float(temperature)
@@ -101,18 +100,30 @@ class GalleryScorer(nn.Module):
         self.normalize_evidence = bool(normalize_evidence)
         if self.top_m < 1 or self.temperature <= 0:
             raise ValueError("top_m and temperature must be positive")
-        self.evidence_gate = nn.Sequential(nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 1))
-        nn.init.zeros_(self.evidence_gate[-1].weight)
-        nn.init.zeros_(self.evidence_gate[-1].bias)
+        self.evidence_gate = None
+        if mode == "learned":
+            self.evidence_gate = nn.Sequential(nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 1))
+            nn.init.zeros_(self.evidence_gate[-1].weight)
+            nn.init.zeros_(self.evidence_gate[-1].bias)
 
-    def forward(self, query, references, reference_labels):
+    def forward(self, query, references, reference_labels, similarity=None):
         if query.ndim != 2 or references.ndim != 2 or len(references) != len(reference_labels):
             raise ValueError("Expected query [Q,D], references [G,D], labels [G]")
         if len(references) == 0:
             raise ValueError("The reference gallery is empty")
+        if similarity is not None and similarity.shape != (len(query), len(references)):
+            raise ValueError("Precomputed similarity must have shape [Q,G]")
         labels = reference_labels.long()
         classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
         n_classes = len(classes)
+        if self.mode == "nearest":
+            if similarity is None:
+                similarity = query @ references.T
+            scaled = similarity / self.temperature
+            scores = scaled.new_full((len(query), n_classes), -torch.inf)
+            scores.scatter_reduce_(1, inverse[None].expand(len(query), -1),
+                                   scaled, reduce="amax", include_self=True)
+            return scores, classes
         counts = torch.bincount(inverse, minlength=n_classes)
         sums = torch.zeros((n_classes, references.shape[1]), dtype=references.dtype,
                            device=references.device).index_add(0, inverse, references)
@@ -121,7 +132,9 @@ class GalleryScorer(nn.Module):
         if self.mode == "prototype":
             return proto, classes
 
-        similarity = query @ references.T / self.temperature
+        if similarity is None:
+            similarity = query @ references.T
+        similarity = similarity / self.temperature
         selected, indices = similarity.topk(min(self.top_m, len(references)), dim=1)
         selected_classes = inverse[indices]
         mask = selected_classes[:, :, None] == torch.arange(n_classes, device=query.device)[None, None, :]
@@ -163,7 +176,8 @@ def episode_objective(embeddings, scorer, n_way, n_support, n_query,
     diagnostics = {"large_ce": float(loss.detach()),
                    "gallery_images": len(large_gallery),
                    "gallery_species": int(large_labels.unique().numel()),
-                   "top_m_active": len(large_gallery) > scorer.top_m}
+                   "top_m_active": scorer.mode in {"learned", "fixed"} and
+                   len(large_gallery) > scorer.top_m}
     if use_variable_gallery:
         n_old = n_way // 2
         old_support = support[:n_old * n_support].reshape(n_old, n_support, -1)[:, 0, :]

@@ -33,6 +33,11 @@ BACKBONES = ("dinov2_vitb14", "dinov2_vits14", "convnext_tiny",
 VARIANTS = {
     "dinov2_pretrained": {"objective": "pretrained", "embedding_dim": 768,
                            "train_backbone": False, "scorer_mode": "prototype"},
+    "metric_retrieval": {"scorer_mode": "nearest", "variable_gallery": False,
+                         "stability_weight": 0.0, "pseudo_ood_weight": 0.0},
+    "prototype_retrieval": {"scorer_mode": "prototype", "variable_gallery": False,
+                            "stability_weight": 0.0, "pseudo_ood_weight": 0.0},
+    "metric_expansion": {"scorer_mode": "nearest"},
     "gallery_adaptive": {},
     "fixed_episode": {"variable_gallery": False, "ways": (16,)},
     "without_expansion_loss": {"stability_weight": 0.0},
@@ -421,11 +426,11 @@ def score_queries(scorer, query, references, reference_labels, device,
     with torch.inference_mode():
         for start in range(0, len(query), chunk_size):
             q = torch.as_tensor(query[start:start + chunk_size], dtype=torch.float32, device=device)
-            current, columns = scorer(q, g, gl)
+            similarity = q @ g.T
+            current, columns = scorer(q, g, gl, similarity=similarity)
             if not torch.equal(columns, torch.arange(len(classes), device=device)):
                 raise ValueError("Gallery scorer omitted a class")
             scores.append(current.float().cpu().numpy())
-            similarity = q @ g.T
             ranked_sims, ranked = similarity.topk(min(rank_k, len(g)), dim=1)
             nearest_sim, nearest_index = ranked_sims[:, 0], ranked[:, 0]
             ranked_labels.append(gl[ranked].cpu().numpy())
@@ -536,7 +541,8 @@ def train_variant(root, out, manifest, cfg, seed, device):
               if cfg["objective"] in {"episode", "supcon"} and cfg["memory_size"] else None)
     for p in encoder.backbone.parameters():
         p.requires_grad_(cfg["train_backbone"])
-    head_parameters = list(encoder.projection.parameters()) + list(scorer.parameters())
+    head_parameters = list(encoder.projection.parameters()) + [
+        p for p in scorer.parameters() if p.requires_grad]
     if classifier is not None:
         head_parameters += list(classifier.parameters())
     groups = [{"params": head_parameters,
@@ -739,7 +745,7 @@ def _predict(scorer, queries, q_labels, gallery, g_labels, device):
                                       for label in sorted(set(q_labels))]))
     image_mrr_at_100 = float(np.mean([rr[q_labels == label].mean()
                                       for label in sorted(set(q_labels))]))
-    return {"gallery_adaptive_r1": macro_accuracy(predictions, q_labels),
+    return {"species_r1": macro_accuracy(predictions, q_labels),
             "nearest_image_r1": macro_accuracy(nearest, q_labels),
             "prototype_r1": macro_accuracy(prototype, q_labels),
             "image_map_at_100": image_map_at_100,
@@ -808,8 +814,8 @@ def _gallery_expansion(scorer, swi, swi_labels, id_emb, id_labels,
     labels = np.r_[swi_labels, ood_labels[reference_idx]]
     old = _predict(scorer, id_emb, id_labels, gallery, labels, device)
     new = _predict(scorer, ood_emb[query_idx], ood_labels[query_idx], gallery, labels, device)
-    return {"old_after_r1": old["gallery_adaptive_r1"],
-            "new_species_r1": new["gallery_adaptive_r1"],
+    return {"old_after_r1": old["species_r1"],
+            "new_species_r1": new["species_r1"],
             "old_nearest_r1": old["nearest_image_r1"],
             "new_nearest_r1": new["nearest_image_r1"],
             "new_gallery_images": len(reference_idx), "new_query_images": len(query_idx),
@@ -834,7 +840,7 @@ def _public_kshot(scorer, id_emb, id_labels, id_frame, device, repeats=30):
             result = _predict(scorer, id_emb[query_idx], id_labels[query_idx],
                               id_emb[refs], id_labels[refs], device)
             results.append({"k": k, "repeat": repeat,
-                            "r1": result["gallery_adaptive_r1"],
+                            "r1": result["species_r1"],
                             "nearest_r1": result["nearest_image_r1"],
                             "prototype_r1": result["prototype_r1"]})
     return pd.DataFrame(results)
@@ -863,7 +869,7 @@ def _cardinality_curve(scorer, id_emb, id_labels, swi_emb, swi_items, device):
         result = _predict(scorer, id_emb, id_labels, swi_emb[indices], labels, device)
         rows.append({"species": n_species, "references_per_species": k_refs,
                      "gallery_images": len(indices),
-                     "r1": result["gallery_adaptive_r1"],
+                     "r1": result["species_r1"],
                      "nearest_r1": result["nearest_image_r1"],
                      "prototype_r1": result["prototype_r1"]})
     return pd.DataFrame(rows)
@@ -926,11 +932,11 @@ def _vn26_generalization(root, run_dir, encoder, scorer, cfg, checkpoint_hash,
             result = _predict(scorer, q_emb[qm], q_labels[qm], g_emb[gm], g_labels[gm], device)
             cross[f"{gallery_mag}_to_{query_mag}"] = {
                 "species": len(shared), "queries": int(qm.sum()),
-                "r1": result["gallery_adaptive_r1"],
+                "r1": result["species_r1"],
                 "nearest_r1": result["nearest_image_r1"],
                 "prototype_r1": result["prototype_r1"]}
     return {"swi_pool_to_vn26_all": {"species": len(common), "queries": int(mask_q.sum()),
-                                       "r1": pool["gallery_adaptive_r1"],
+                                       "r1": pool["species_r1"],
                                        "nearest_r1": pool["nearest_image_r1"],
                                        "prototype_r1": pool["prototype_r1"]},
             "cross_magnification": cross,
@@ -990,7 +996,7 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
             id_distance = prediction["distance"]
             id_mask = mask
         print(f"[gallery] {cfg['variant']} seed={seed} {scope}: "
-              f"R@1={prediction['gallery_adaptive_r1']:.4f}", flush=True)
+              f"R@1={prediction['species_r1']:.4f}", flush=True)
     ood_test = _ood_test_mask(ood_labels)
     ood_distance = nearest_distances(matrices["ood"][ood_test],
                                      matrices["swi"][id_mask], device)
@@ -1041,7 +1047,7 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
 
 def run():
     root = Path(os.environ.get("ROOT_PATH", "/content/drive/MyDrive/NCS")).resolve()
-    out = Path(os.environ.get("GALLERY_STUDY_OUT", root / "results" / "gallery_adaptive_study")).resolve()
+    out = Path(os.environ.get("GALLERY_STUDY_OUT", root / "results" / "metric_retrieval_study")).resolve()
     mode = os.environ.get("GALLERY_STUDY_MODE", "pilot").lower()
     if mode not in {"smoke", "backbone_smoke", "preflight", "pilot", "train", "evaluate"}:
         raise ValueError("GALLERY_STUDY_MODE must be smoke, backbone_smoke, preflight, pilot, train, or evaluate")
@@ -1057,7 +1063,7 @@ def run():
     if device.type != "cuda" and mode in {"pilot", "train"}:
         raise RuntimeError("Full-backbone training requires a CUDA runtime")
     pilot = mode == "pilot" or os.environ.get("GALLERY_STUDY_PILOT_CHECKPOINTS", "0") == "1"
-    default_variants = "gallery_adaptive,fixed_episode,supcon_finetuned" if mode == "pilot" else "gallery_adaptive"
+    default_variants = "metric_retrieval,prototype_retrieval" if mode == "pilot" else "metric_retrieval"
     variants = [name.strip() for name in os.environ.get("GALLERY_STUDY_VARIANTS", default_variants).split(",")]
     seeds = [int(x.strip()) for x in os.environ.get("GALLERY_STUDY_SEEDS", "42" if mode == "pilot" else "42,43,44").split(",")]
     if any(name not in VARIANTS for name in variants) or len(set(variants)) != len(variants):
@@ -1120,8 +1126,8 @@ def run():
             rows.append({"variant": report["variant"], "backbone": report["backbone"],
                          "seed": report["seed"],
                          "meta_val_selection": report["selection"]["selection_score"],
-                         "id24_r1": report["scopes"]["id_only"]["gallery_adaptive_r1"],
-                         "matched954_r1": report["scopes"]["full_swi"]["gallery_adaptive_r1"],
+                         "id24_r1": report["scopes"]["id_only"]["species_r1"],
+                         "matched954_r1": report["scopes"]["full_swi"]["species_r1"],
                          "id24_map100": report["scopes"]["id_only"]["image_map_at_100"],
                          "matched954_map100": report["scopes"]["full_swi"]["image_map_at_100"],
                          "id24_mrr100": report["scopes"]["id_only"]["image_mrr_at_100"],
@@ -1138,12 +1144,12 @@ def run():
         summary = table.groupby(["backbone", "variant"])[columns].agg(["mean", "std", "count"])
         summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
         summary.to_csv(out / "comparison_summary.csv")
-        if "gallery_adaptive" in set(table["variant"]):
-            proposed = table[table["variant"] == "gallery_adaptive"].set_index(
+        if "metric_retrieval" in set(table["variant"]):
+            proposed = table[table["variant"] == "metric_retrieval"].set_index(
                 ["backbone", "seed"])
             paired = []
             for (backbone, variant), frame in table.groupby(["backbone", "variant"]):
-                if variant == "gallery_adaptive":
+                if variant == "metric_retrieval":
                     continue
                 current = frame.set_index(["backbone", "seed"])
                 for _, seed in proposed.index.intersection(current.index):
@@ -1165,7 +1171,7 @@ def run():
 def smoke_test(device, real_backbone=False, backbone="dinov2_vitb14"):
     from torch import nn
     _seed(42)
-    cfg = variant_config("gallery_adaptive", pilot=True)
+    cfg = variant_config("metric_retrieval", pilot=True)
     cfg.update(microbatch=2, support=2, queries=1, ways=(4,), backbone=backbone,
                top_m=4, memory_size=12, memory_min_classes=8)
     if real_backbone:
@@ -1174,9 +1180,10 @@ def smoke_test(device, real_backbone=False, backbone="dinov2_vitb14"):
     else:
         backbone = nn.Sequential(nn.Flatten(), nn.Linear(3 * 8 * 8, 768), nn.LayerNorm(768))
         encoder = GalleryEncoder(backbone, embedding_dim=512).to(device)
-        scorer = GalleryScorer(mode="learned").to(device)
+        scorer = GalleryScorer(mode="nearest").to(device)
         size = 8
-    optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(scorer.parameters()), lr=1e-4)
+    optimizer = torch.optim.AdamW(list(encoder.parameters()) +
+                                  [p for p in scorer.parameters() if p.requires_grad], lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     images = torch.randn(12, 3, size, size)
     labels = torch.arange(4).repeat_interleave(2).tolist() + list(range(4))
@@ -1189,8 +1196,8 @@ def smoke_test(device, real_backbone=False, backbone="dinov2_vitb14"):
                                       optimizer, scaler, device, memory=memory)
         if not np.isfinite(loss):
             raise RuntimeError("Gallery study smoke test returned a non-finite loss")
-        if not details["top_m_active"]:
-            raise RuntimeError("Gallery study smoke test did not activate top-M scoring")
+        if details["top_m_active"]:
+            raise RuntimeError("Exact nearest retrieval unexpectedly activated top-M scoring")
     if torch.equal(initial, watched.detach()):
         raise RuntimeError("Gallery study smoke test did not update the backbone")
     print(f"[gallery] {backbone if real_backbone else 'synthetic'} smoke test passed "
