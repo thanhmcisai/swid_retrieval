@@ -22,17 +22,24 @@ from torch.utils.data import BatchSampler, DataLoader, WeightedRandomSampler
 
 from . import data
 from .gallery_method import (ArcFaceClassifier, GalleryEncoder, GalleryMemory, GalleryScorer,
-                             episode_objective, supervised_contrastive_loss)
+                             episode_objective, local_species_scores,
+                             supervised_contrastive_loss)
 from .wood_encoder import WoodPatternNet
 
 DINO_REPO_REF = "facebookresearch/dinov2:7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+DINO_V3_REPO_REF = "facebookresearch/dinov3:6876159a11b4df116f30f667f8c9888617df0751"
 BACKBONES = ("dinov2_vitb14", "dinov2_vits14", "convnext_tiny",
-             "woodpattern_tiny", "woodpattern_no_attention", "woodpattern_single_scale")
+             "dinov3_vits16", "woodpattern_tiny", "woodpattern_no_attention",
+             "woodpattern_single_scale")
 
 
 VARIANTS = {
     "dinov2_pretrained": {"objective": "pretrained", "embedding_dim": 768,
                            "train_backbone": False, "scorer_mode": "prototype"},
+    "pretrained_control": {"objective": "pretrained", "train_backbone": False,
+                           "scorer_mode": "prototype"},
+    "pretrained_nearest": {"objective": "pretrained", "train_backbone": False,
+                           "scorer_mode": "nearest"},
     "supervised_warmup": {"objective": "supervised_warmup", "scorer_mode": "nearest",
                           "memory_size": 0, "memory_min_classes": 0},
     "metric_retrieval": {"scorer_mode": "nearest", "variable_gallery": False,
@@ -58,6 +65,40 @@ VARIANTS = {
     "top_m_128": {"top_m": 128, "memory_min_classes": 160},
     "supcon_finetuned": {"objective": "supcon", "scorer_mode": "prototype"},
     "arcface_finetuned": {"objective": "arcface", "scorer_mode": "prototype"},
+    "metric_large": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                     "memory_size": 0, "memory_min_classes": 0,
+                     "variable_gallery": False, "stability_weight": 0.0,
+                     "pseudo_ood_weight": 0.0},
+    "metric_large_ce": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                        "memory_size": 0, "memory_min_classes": 0,
+                        "variable_gallery": False, "stability_weight": 0.0,
+                        "pseudo_ood_weight": 0.0, "aux_ce_weight": 0.2},
+    "metric_large_no_hard": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                             "memory_size": 0, "memory_min_classes": 0,
+                             "variable_gallery": False, "stability_weight": 0.0,
+                             "pseudo_ood_weight": 0.0, "hard_negative_probability": 0.0},
+    "metric_large_scale": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                           "memory_size": 0, "memory_min_classes": 0,
+                           "variable_gallery": False, "stability_weight": 0.0,
+                           "pseudo_ood_weight": 0.0, "cross_scale": True,
+                           "positive_weight": 0.1},
+    "prototype_large": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                        "memory_size": 0, "memory_min_classes": 0,
+                        "variable_gallery": False, "stability_weight": 0.0,
+                        "pseudo_ood_weight": 0.0},
+    "supcon_large": {"objective": "supcon", "scorer_mode": "prototype",
+                     "ways": (16, 32, 64), "memory_size": 0, "memory_min_classes": 0,
+                     "variable_gallery": False},
+    "local_evidence": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                       "memory_size": 0, "memory_min_classes": 0,
+                       "variable_gallery": False, "stability_weight": 0.0,
+                       "pseudo_ood_weight": 0.0, "local_weight": 0.35},
+    "local_evidence_ce_scale": {"scorer_mode": "nearest", "ways": (16, 32, 64),
+                                "memory_size": 0, "memory_min_classes": 0,
+                                "variable_gallery": False, "stability_weight": 0.0,
+                                "pseudo_ood_weight": 0.0, "local_weight": 0.35,
+                                "aux_ce_weight": 0.2, "cross_scale": True,
+                                "positive_weight": 0.1},
 }
 
 
@@ -126,23 +167,38 @@ def source_scan_id(path):
     return match.group(1).lower()
 
 
+def image_scale(path):
+    parent = Path(path).parent.name.lower()
+    match = re.fullmatch(r"scale_(\d+)", parent)
+    if match is None:
+        match = re.match(r"patch_(\d+)_", Path(path).name.lower())
+    return int(match.group(1)) if match else None
+
+
 def source_scan_audit(manifest):
     summary = {}
     seen = {}
     for split in ("meta-train", "meta-val", "meta-test"):
         by_species = defaultdict(set)
+        scales_by_scan = defaultdict(lambda: defaultdict(set))
         for path, label in manifest[split]:
             species, scan = canonical(label), source_scan_id(path)
             if scan in seen and seen[scan] != species:
                 raise ValueError(f"Source scan {scan} has conflicting species labels")
             seen[scan] = species
             by_species[species].add(scan)
+            scales_by_scan[species][scan].add(image_scale(path))
         summary[split] = {"species": len(by_species),
                           "source_scans": len(set().union(*by_species.values())),
                           "species_with_two_or_more_scans": sum(
                               len(scans) >= 2 for scans in by_species.values()),
                           "species_with_one_scan": sum(
-                              len(scans) == 1 for scans in by_species.values())}
+                              len(scans) == 1 for scans in by_species.values()),
+                          "species_with_cross_scale_scans": sum(
+                              any(left_scales != right_scales or len(left_scales | right_scales) > 1
+                                  for left_id, left_scales in scans.items()
+                                  for right_id, right_scales in scans.items() if left_id != right_id)
+                              for scans in scales_by_scan.values())}
     return summary
 
 
@@ -151,7 +207,8 @@ def variant_config(name, *, pilot=False):
         raise ValueError(f"Unknown variant {name}; choose from {sorted(VARIANTS)}")
     backbone = os.environ.get("GALLERY_STUDY_BACKBONE", "dinov2_vitb14").lower()
     default_backbone_lr = (5e-4 if backbone.startswith("woodpattern_") else
-                           3e-5 if backbone in {"dinov2_vits14", "convnext_tiny"} else 1e-5)
+                           3e-5 if backbone in {"dinov2_vits14", "dinov3_vits16",
+                                                    "convnext_tiny"} else 1e-5)
     config = {
         "variant": name,
         "backbone": backbone,
@@ -182,8 +239,28 @@ def variant_config(name, *, pilot=False):
         "normalize_evidence": True,
         "scorer_mode": "learned",
         "objective": "episode",
+        "aux_ce_weight": 0.0,
+        "positive_weight": 0.0,
+        "local_weight": 0.0,
+        "local_dim": 64,
+        "local_candidates": 32,
+        "local_refs_per_species": 3,
+        "cross_scale": False,
+        "validation_folds": int(os.environ.get("GALLERY_STUDY_VALIDATION_FOLDS", "1")),
+        "validation_train_distractors": int(os.environ.get(
+            "GALLERY_STUDY_VALIDATION_TRAIN_DISTRACTORS", "0")),
     }
     config.update(VARIANTS[name])
+    if os.environ.get("GALLERY_STUDY_WAYS"):
+        config["ways"] = tuple(int(x) for x in os.environ["GALLERY_STUDY_WAYS"].split(","))
+    if os.environ.get("GALLERY_STUDY_IMAGE_SIZE"):
+        config["image_size"] = int(os.environ["GALLERY_STUDY_IMAGE_SIZE"])
+    if backbone == "dinov3_vits16":
+        weights = os.environ.get("GALLERY_STUDY_DINOV3_WEIGHTS", "").strip()
+        if not weights or not Path(weights).is_file():
+            raise FileNotFoundError("DINOv3 requires a licensed local GALLERY_STUDY_DINOV3_WEIGHTS file")
+        config["dinov3_weights"] = str(Path(weights).resolve())
+        config["dinov3_weights_sha256"] = _hash_file(weights)
     if config["objective"] == "supervised_warmup":
         config.update({
             "warmup_epochs": int(os.environ.get("GALLERY_STUDY_WARMUP_EPOCHS", "5")),
@@ -197,8 +274,24 @@ def variant_config(name, *, pilot=False):
         config["init_checkpoint_sha256"] = _hash_file(init_path)
     if config["backbone"] not in BACKBONES:
         raise ValueError(f"Unknown backbone {config['backbone']}; choose from {BACKBONES}")
-    if config["objective"] == "pretrained" and config["backbone"] != "dinov2_vitb14":
+    if name in {"pretrained_control", "pretrained_nearest"}:
+        if config["backbone"].startswith("woodpattern_"):
+            raise ValueError("No pretrained weights exist for WoodPatternNet")
+        config["embedding_dim"] = (384 if config["backbone"] in {"dinov2_vits14",
+                                                             "dinov3_vits16"} else 768)
+    if name == "dinov2_pretrained" and config["backbone"] != "dinov2_vitb14":
         raise ValueError("The pretrained 768-dimensional control requires dinov2_vitb14")
+    if config["local_weight"] and not config["backbone"].startswith("woodpattern_"):
+        raise ValueError("Local evidence currently requires WoodPatternNet")
+    if config["local_weight"] and config["memory_size"]:
+        raise ValueError("Local evidence requires current-episode references without stale memory")
+    if (not config["ways"] or min(config["ways"]) < 2 or
+            not 0 <= config["local_weight"] <= 1 or
+            config["aux_ce_weight"] < 0 or config["positive_weight"] < 0 or
+            config["validation_folds"] < 1 or config["validation_folds"] > 5 or
+            config["validation_train_distractors"] not in {0, 1} or
+            config["local_candidates"] < 1 or config["local_refs_per_species"] < 1):
+        raise ValueError("Invalid retrieval study recipe")
     if config["objective"] == "supervised_warmup":
         if not config["backbone"].startswith("woodpattern_"):
             raise ValueError("Supervised warm-up currently supports WoodPatternNet only")
@@ -218,7 +311,8 @@ class EpisodeSampler(BatchSampler):
     """Samples labelled support and query images without replacement."""
 
     def __init__(self, labels, ways, support, queries, episodes, seed,
-                 hard_negative_probability=0.5, groups=None):
+                 hard_negative_probability=0.5, groups=None, scales=None,
+                 cross_scale=False):
         self.labels = np.asarray([canonical(x) for x in labels])
         self.ways = tuple(int(x) for x in ways)
         self.support = int(support)
@@ -226,6 +320,10 @@ class EpisodeSampler(BatchSampler):
         self.episodes = int(episodes)
         self.seed = int(seed)
         self.hard_negative_probability = float(hard_negative_probability)
+        self.scales = None if scales is None else np.asarray(scales)
+        self.cross_scale = bool(cross_scale)
+        if self.cross_scale and (groups is None or self.scales is None or len(self.scales) != len(labels)):
+            raise ValueError("Cross-scale sampling requires aligned scans and image scales")
         self.by_class = {c: np.flatnonzero(self.labels == c) for c in sorted(set(self.labels))}
         self.by_group = {}
         self.group_options = {}
@@ -254,6 +352,8 @@ class EpisodeSampler(BatchSampler):
 
     def __iter__(self):
         rng = np.random.RandomState(self.seed)
+        self.cross_scale_groups = 0
+        self.episode_groups = 0
         for _ in range(self.episodes):
             n_way = int(rng.choice(self.ways))
             selected = []
@@ -266,16 +366,23 @@ class EpisodeSampler(BatchSampler):
             rng.shuffle(selected)
             support_indices, query_indices = [], []
             for species in selected:
+                self.episode_groups += 1
                 if self.by_group:
                     query_group = rng.choice(self.group_options[species])
                     query_pool = self.by_group[species][query_group]
                     support_pool = np.concatenate([
                         indices for name, indices in self.by_group[species].items()
                         if name != query_group])
+                    selected_queries = rng.choice(query_pool, self.queries, replace=False)
+                    if self.cross_scale:
+                        scales = set(self.scales[selected_queries])
+                        alternatives = support_pool[~np.isin(self.scales[support_pool], list(scales))]
+                        if len(alternatives) >= self.support:
+                            support_pool = alternatives
+                            self.cross_scale_groups += 1
                     support_indices.extend(rng.choice(
                         support_pool, self.support, replace=False).tolist())
-                    query_indices.extend(rng.choice(
-                        query_pool, self.queries, replace=False).tolist())
+                    query_indices.extend(selected_queries.tolist())
                 else:
                     draw = rng.choice(self.by_class[species],
                                       self.support + self.queries, replace=False)
@@ -287,7 +394,7 @@ class EpisodeSampler(BatchSampler):
         return self.episodes
 
 
-def validation_items(manifest, support=5, queries=5, group_mode="image"):
+def validation_items(manifest, support=5, queries=5, group_mode="image", fold=0):
     by_class = defaultdict(list)
     for path, label in manifest["meta-val"]:
         by_class[canonical(label)].append((path, canonical(label)))
@@ -302,7 +409,8 @@ def validation_items(manifest, support=5, queries=5, group_mode="image"):
                        sum(len(other) for key, other in by_scan.items() if key != scan) >= support]
             if not options:
                 continue
-            query_scan = sorted(options, key=lambda scan: _hash_bytes(scan.encode()))[0]
+            ordered_options = sorted(options, key=lambda scan: _hash_bytes(scan.encode()))
+            query_scan = ordered_options[fold % len(ordered_options)]
             ref_pool = [item for scan, entries in by_scan.items() if scan != query_scan
                         for item in entries]
             query_pool = by_scan[query_scan]
@@ -335,6 +443,12 @@ def _model(cfg, device, pretrained=True):
     if kind.startswith("dinov2_"):
         backbone = torch.hub.load(DINO_REPO_REF, kind, pretrained=pretrained)
         feature_dim = 384 if kind == "dinov2_vits14" else 768
+    elif kind == "dinov3_vits16":
+        if _hash_file(cfg["dinov3_weights"]) != cfg["dinov3_weights_sha256"]:
+            raise ValueError("DINOv3 weights changed after recipe selection")
+        backbone = torch.hub.load(DINO_V3_REPO_REF, kind, pretrained=True,
+                                  weights=cfg["dinov3_weights"])
+        feature_dim = 384
     elif kind == "convnext_tiny":
         import timm
         backbone = timm.create_model("convnext_tiny", pretrained=pretrained, num_classes=0)
@@ -344,7 +458,8 @@ def _model(cfg, device, pretrained=True):
                                   use_multiscale=kind != "woodpattern_single_scale")
         feature_dim = backbone.num_features
     encoder = GalleryEncoder(backbone, feature_dim=feature_dim,
-                             embedding_dim=cfg["embedding_dim"]).to(device)
+                             embedding_dim=cfg["embedding_dim"],
+                             local_dim=cfg.get("local_dim", 64) if cfg.get("local_weight") else 0).to(device)
     if cfg["objective"] == "pretrained":
         encoder.projection = torch.nn.Identity()
     scorer = GalleryScorer(cfg["top_m"], cfg["temperature"], cfg["scorer_mode"],
@@ -369,6 +484,20 @@ def encode_items(encoder, items, cfg, device):
     return np.concatenate(outputs) if outputs else np.empty((0, cfg["embedding_dim"]), np.float32)
 
 
+def encode_items_with_tokens(encoder, items, cfg, device):
+    encoder.eval()
+    globals_, locals_ = [], []
+    with torch.inference_mode():
+        for images, _ in _loader(items, cfg):
+            with _autocast(device):
+                global_emb, tokens = encoder.forward_with_tokens(images.to(device, non_blocking=True))
+            if not torch.isfinite(global_emb).all() or not torch.isfinite(tokens).all():
+                raise RuntimeError("Non-finite validation evidence")
+            globals_.append(global_emb.float().cpu().numpy())
+            locals_.append(tokens.float().cpu().numpy())
+    return np.concatenate(globals_), np.concatenate(locals_)
+
+
 def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler, device,
                   classifier=None, memory=None):
     images = images.to(device, non_blocking=True)
@@ -388,15 +517,23 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
     encoder.backbone.eval()
     encoder.projection.train()
     scorer.train()
-    features = []
+    features, token_features = [], []
     with torch.no_grad():
         for chunk in images.split(cfg["microbatch"]):
             with _autocast(device):
-                features.append(encoder.backbone(chunk).float())
+                if cfg.get("local_weight", 0):
+                    global_chunk, token_chunk = encoder.backbone.forward_with_tokens(chunk)
+                    token_features.append(token_chunk.float())
+                    features.append(global_chunk.float())
+                else:
+                    features.append(encoder.backbone(chunk).float())
     features = torch.cat(features).detach().requires_grad_(cfg["train_backbone"])
+    tokens = (torch.cat(token_features).detach().requires_grad_(cfg["train_backbone"])
+              if token_features else None)
     if not torch.isfinite(features).all():
         raise RuntimeError("Non-finite backbone features before gallery loss; checkpoint was not advanced")
     embeddings = encoder.project(features)
+    local_tokens = encoder.project_tokens(tokens) if tokens is not None else None
     if not torch.isfinite(embeddings).all():
         raise RuntimeError("Non-finite projected embeddings before gallery loss; checkpoint was not advanced")
     background = None
@@ -418,10 +555,39 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
                       if memory is not None else None)
         if background is not None and not torch.isfinite(background[0]).all():
             raise RuntimeError("Non-finite gallery memory before loss; checkpoint was not advanced")
-        loss, details = episode_objective(
-            embeddings, scorer, n_way, cfg["support"], cfg["queries"],
-            cfg["stability_weight"], cfg["variable_gallery"],
-            cfg["pseudo_ood_weight"], background=background)
+        if local_tokens is not None:
+            if background is not None or cfg["variable_gallery"]:
+                raise ValueError("Local evidence training requires a current-episode gallery")
+            labels = torch.arange(n_way, device=device).repeat_interleave(cfg["support"])
+            targets = torch.arange(n_way, device=device).repeat_interleave(cfg["queries"])
+            global_scores, classes = scorer(embeddings[n_support:], embeddings[:n_support], labels)
+            local_scores, local_classes = local_species_scores(
+                local_tokens[n_support:], local_tokens[:n_support], labels, cfg["temperature"])
+            if not torch.equal(classes, local_classes):
+                raise RuntimeError("Global and local episode class order differs")
+            scores = ((1 - cfg["local_weight"]) * global_scores +
+                      cfg["local_weight"] * local_scores)
+            loss = F.cross_entropy(scores, targets)
+            details = {"large_ce": float(loss.detach()),
+                       "train_episode_r1": float((scores.argmax(1) == targets).float().mean().detach()),
+                       "gallery_images": n_support, "gallery_species": n_way,
+                       "top_m_active": False}
+        else:
+            loss, details = episode_objective(
+                embeddings, scorer, n_way, cfg["support"], cfg["queries"],
+                cfg["stability_weight"], cfg["variable_gallery"],
+                cfg["pseudo_ood_weight"], background=background)
+        if cfg.get("positive_weight", 0):
+            support = embeddings[:n_support].reshape(n_way, cfg["support"], -1)
+            queries = embeddings[n_support:].reshape(n_way, cfg["queries"], -1)
+            positive = 1 - (queries * F.normalize(support.mean(dim=1), dim=-1)[:, None]).sum(-1)
+            positive = positive.mean()
+            loss = loss + cfg["positive_weight"] * positive
+            details["positive_loss"] = float(positive.detach())
+        if cfg.get("aux_ce_weight", 0):
+            auxiliary = F.cross_entropy(classifier(embeddings), batch_labels.to(device))
+            loss = loss + cfg["aux_ce_weight"] * auxiliary
+            details["aux_ce"] = float(auxiliary.detach())
     if not torch.isfinite(loss):
         feature_finite = bool(torch.isfinite(features).all())
         embedding_finite = bool(torch.isfinite(embeddings).all())
@@ -434,11 +600,19 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
     scaler.scale(loss).backward()
     if cfg["train_backbone"]:
         feature_grad = features.grad.detach()
+        token_grad = tokens.grad.detach() if tokens is not None else None
         offset = 0
         for chunk in images.split(cfg["microbatch"]):
             with _autocast(device):
-                replayed = encoder.backbone(chunk).float()
-            torch.autograd.backward(replayed, feature_grad[offset:offset + len(chunk)])
+                replayed = (encoder.backbone.forward_with_tokens(chunk) if tokens is not None
+                            else encoder.backbone(chunk))
+            if tokens is not None:
+                torch.autograd.backward(
+                    tuple(part.float() for part in replayed),
+                    (feature_grad[offset:offset + len(chunk)],
+                     token_grad[offset:offset + len(chunk)]))
+            else:
+                torch.autograd.backward(replayed.float(), feature_grad[offset:offset + len(chunk)])
             offset += len(chunk)
     scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -487,6 +661,56 @@ def score_queries(scorer, query, references, reference_labels, device,
             np.concatenate(ranked_labels))
 
 
+def score_queries_evidence(scorer, query, references, reference_labels,
+                           query_tokens, reference_tokens, cfg, device, chunk_size=32):
+    """Rerank a bounded class shortlist using query-conditioned reference tokens."""
+    if (len(query) != len(query_tokens) or len(references) != len(reference_tokens) or
+            len(references) != len(reference_labels)):
+        raise ValueError("Global/local gallery rows are not aligned")
+    g = torch.as_tensor(np.asarray(references), dtype=torch.float32, device=device)
+    classes, inverse = np.unique(np.asarray(reference_labels), return_inverse=True)
+    labels = torch.as_tensor(inverse, dtype=torch.long, device=device)
+    by_class = [np.flatnonzero(inverse == index) for index in range(len(classes))]
+    output = []
+    scorer.eval()
+    with torch.inference_mode():
+        for start in range(0, len(query), chunk_size):
+            q = torch.as_tensor(np.asarray(query[start:start + chunk_size]),
+                                dtype=torch.float32, device=device)
+            similarity = q @ g.T
+            global_scores, columns = scorer(q, g, labels, similarity=similarity)
+            if not torch.equal(columns, torch.arange(len(classes), device=device)):
+                raise RuntimeError("Global/local species order differs")
+            n = min(cfg["local_candidates"], len(classes))
+            candidates = global_scores.topk(n, dim=1).indices.cpu().numpy()
+            sims = similarity.cpu().numpy()
+            r = cfg["local_refs_per_species"]
+            selected = np.empty((len(q), n, r), dtype=np.int64)
+            for row in range(len(q)):
+                for col, class_id in enumerate(candidates[row]):
+                    indices = by_class[class_id]
+                    top = np.argsort(sims[row, indices], kind="stable")[-r:][::-1]
+                    picks = indices[top]
+                    selected[row, col] = np.resize(picks, r)
+            qt = torch.as_tensor(np.asarray(query_tokens[start:start + len(q)]),
+                                 dtype=torch.float32, device=device)
+            rt = torch.as_tensor(np.asarray(reference_tokens[selected]),
+                                 dtype=torch.float32, device=device)
+            affinity = torch.einsum("btd,bcrsd->bcrts", qt, rt)
+            local = (affinity.max(dim=4).values.mean(dim=3) +
+                     affinity.max(dim=3).values.mean(dim=3)).amax(dim=2) / 2
+            local = local / cfg["temperature"]
+            updated = global_scores.clone()
+            candidate_t = torch.as_tensor(candidates, device=device, dtype=torch.long)
+            global_candidates = global_scores.gather(1, candidate_t)
+            updated.scatter_(1, candidate_t, (1 - cfg["local_weight"]) * global_candidates +
+                             cfg["local_weight"] * local)
+            if not torch.isfinite(updated).all():
+                raise RuntimeError("Non-finite local evidence scores")
+            output.append(updated.cpu().numpy())
+    return np.concatenate(output), classes
+
+
 def nearest_distances(query, references, device, chunk_size=32):
     g = torch.as_tensor(references, dtype=torch.float32, device=device)
     output = []
@@ -497,33 +721,96 @@ def nearest_distances(query, references, device, chunk_size=32):
     return np.concatenate(output)
 
 
-def _validation(encoder, scorer, manifest, cfg, device):
+def _validation_once(encoder, scorer, manifest, cfg, device, fold):
     reference_items, probe_items = validation_items(
-        manifest, group_mode=cfg["group_mode"])
-    refs = encode_items(encoder, reference_items, cfg, device)
-    probes = encode_items(encoder, probe_items, cfg, device)
+        manifest, group_mode=cfg["group_mode"], fold=fold)
+    if cfg.get("local_weight", 0):
+        refs, ref_tokens = encode_items_with_tokens(encoder, reference_items, cfg, device)
+        probes, probe_tokens = encode_items_with_tokens(encoder, probe_items, cfg, device)
+    else:
+        refs = encode_items(encoder, reference_items, cfg, device)
+        probes = encode_items(encoder, probe_items, cfg, device)
     reference_spread = float(np.linalg.norm(refs.std(axis=0)))
     ref_labels = np.asarray([canonical(y) for _, y in reference_items])
     probe_labels = np.asarray([canonical(y) for _, y in probe_items])
-    scores, classes, *_ = score_queries(scorer, probes, refs, ref_labels, device)
+    if cfg.get("local_weight", 0):
+        scores, classes = score_queries_evidence(
+            scorer, probes, refs, ref_labels, probe_tokens, ref_tokens, cfg, device)
+    else:
+        scores, classes, *_ = score_queries(scorer, probes, refs, ref_labels, device)
     full = float(np.mean([np.mean(classes[scores.argmax(1)][probe_labels == c] == c)
                           for c in sorted(set(probe_labels))]))
     subset = set(sorted(set(ref_labels), key=lambda label: _hash_bytes(label.encode()))[:24])
     mask_r = np.asarray([c in subset for c in ref_labels])
     mask_q = np.asarray([c in subset for c in probe_labels])
-    small_scores, small_classes, *_ = score_queries(
-        scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r], device)
+    if cfg.get("local_weight", 0):
+        small_scores, small_classes = score_queries_evidence(
+            scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r],
+            probe_tokens[mask_q], ref_tokens[mask_r], cfg, device)
+    else:
+        small_scores, small_classes, *_ = score_queries(
+            scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r], device)
     small_labels = probe_labels[mask_q]
     small = float(np.mean([np.mean(small_classes[small_scores.argmax(1)][small_labels == c] == c)
                            for c in sorted(subset)]))
-    # Predeclared, equal-weight model selection over two gallery cardinalities.
-    return {"meta_val_r1_all": full, "meta_val_r1_24": small,
+    result = {"meta_val_r1_all": full, "meta_val_r1_24": small,
             "selection_score": (full + small) / 2,
             "reference_embedding_spread": reference_spread,
             "validation_species": len(set(ref_labels)),
             "group_mode": cfg["group_mode"],
             "small_gallery_species": [str(label) for label in sorted(subset)],
-            "validation_reference_images": len(reference_items), "validation_query_images": len(probe_items)}
+            "validation_reference_images": len(reference_items), "validation_query_images": len(probe_items),
+            "fold": fold}
+    if cfg.get("validation_train_distractors", 0):
+        selected = set(ref_labels)
+        first_per_class = {}
+        for index, label in enumerate(ref_labels):
+            first_per_class.setdefault(label, index)
+        balanced_indices = list(first_per_class.values())
+        extra_by_class = defaultdict(list)
+        for split in ("meta-train", "meta-val"):
+            for path, label in manifest[split]:
+                label = canonical(label)
+                if label not in selected:
+                    extra_by_class[label].append((path, label))
+        extra = [min(rows, key=lambda row: _hash_bytes(row[0].encode()))
+                 for _, rows in sorted(extra_by_class.items())]
+        if cfg.get("local_weight", 0):
+            extra_emb, extra_tokens = encode_items_with_tokens(encoder, extra, cfg, device)
+            stress_tokens = np.concatenate((ref_tokens[balanced_indices], extra_tokens))
+        else:
+            extra_emb = encode_items(encoder, extra, cfg, device)
+        stress_emb = np.concatenate((refs[balanced_indices], extra_emb))
+        stress_labels = np.r_[ref_labels[balanced_indices], [label for _, label in extra]]
+        if cfg.get("local_weight", 0):
+            stress_scores, stress_classes = score_queries_evidence(
+                scorer, probes, stress_emb, stress_labels, probe_tokens, stress_tokens, cfg, device)
+        else:
+            stress_scores, stress_classes, *_ = score_queries(
+                scorer, probes, stress_emb, stress_labels, device)
+        stress = float(np.mean([np.mean(stress_classes[stress_scores.argmax(1)][probe_labels == c] == c)
+                                for c in sorted(set(probe_labels))]))
+        result.update(meta_val_r1_stress=stress, stress_gallery_species=len(set(stress_labels)),
+                      stress_gallery_images=len(stress_emb),
+                      stress_references_per_species=1,
+                      selection_score=(small + stress) / 2)
+    return result
+
+
+def _validation(encoder, scorer, manifest, cfg, device):
+    folds = [_validation_once(encoder, scorer, manifest, cfg, device, fold)
+             for fold in range(cfg.get("validation_folds", 1))]
+    if len(folds) == 1:
+        return folds[0]
+    summary = dict(folds[0])
+    for name in ("meta_val_r1_all", "meta_val_r1_24", "selection_score",
+                 "reference_embedding_spread"):
+        summary[name] = float(np.mean([fold[name] for fold in folds]))
+    if "meta_val_r1_stress" in folds[0]:
+        summary["meta_val_r1_stress"] = float(np.mean([fold["meta_val_r1_stress"] for fold in folds]))
+    summary["fold_metrics"] = folds
+    summary["validation_folds"] = len(folds)
+    return summary
 
 
 def _save_checkpoint(path, payload):
@@ -537,6 +824,7 @@ def _save_checkpoint(path, payload):
 def _run_signature(root, cfg, seed):
     payload = {"config": cfg, "seed": seed,
                "dino_repo_ref": DINO_REPO_REF,
+               "dino_v3_repo_ref": DINO_V3_REPO_REF,
                "manifest_sha256": _hash_file(root / "swi_manifest.json"),
                "runner_sha256": _hash_file(__file__),
                "model_sha256": _hash_file(Path(__file__).with_name("gallery_method.py")),
@@ -646,6 +934,7 @@ def train_supervised_warmup(root, out, manifest, cfg, seed, device):
               f"train_acc={np.mean([step['accuracy'] for step in steps]):.4f} "
               f"val24={validation['meta_val_r1_24']:.4f} "
               f"val{validation['validation_species']}={validation['meta_val_r1_all']:.4f} "
+              f"stress={validation.get('meta_val_r1_stress', float('nan')):.4f} "
               f"ref_spread={validation['reference_embedding_spread']:.4f} "
               f"amp_skips={skipped_steps}/{len(steps)} "
               f"train_s={train_seconds:.1f} peak_gb={peak_gb}", flush=True)
@@ -688,7 +977,13 @@ def _load_warmup_encoder(root, cfg, seed, encoder):
         raise ValueError(f"Warm-up checkpoint is not aligned with this metric run: {path}")
     if _hash_file(path) != cfg["init_checkpoint_sha256"]:
         raise ValueError(f"Warm-up checkpoint changed after configuration: {path}")
-    encoder.load_state_dict(state["encoder"], strict=True)
+    if cfg.get("local_weight", 0):
+        missing, unexpected = encoder.load_state_dict(state["encoder"], strict=False)
+        if set(missing) != {"local_projection.0.weight", "local_projection.0.bias",
+                            "local_projection.1.weight", "local_projection.1.bias"} or unexpected:
+            raise ValueError(f"Warm-up encoder mismatch: missing={missing}, unexpected={unexpected}")
+    else:
+        encoder.load_state_dict(state["encoder"], strict=True)
     print(f"[gallery] Initialized {cfg['variant']} seed={seed} from supervised warm-up "
           f"epoch {state['epoch']} ({Path(path).name})", flush=True)
 
@@ -730,16 +1025,20 @@ def train_variant(root, out, manifest, cfg, seed, device):
                                 "initial_backbone_sha256": initial_backbone_sha256,
                                 "validation": validation, "encoder": encoder.state_dict(),
                                 "scorer": scorer.state_dict(), "classifier": None})
-        print(f"[gallery] Saved same-resolution pretrained DINOv2 control: {best}", flush=True)
+        print(f"[gallery] Saved same-resolution pretrained control: {best}", flush=True)
         return best
     classifier = (ArcFaceClassifier(cfg["embedding_dim"], len(dataset.class_to_idx)).to(device)
-                  if cfg["objective"] == "arcface" else None)
+                  if cfg["objective"] == "arcface" else
+                  torch.nn.Linear(cfg["embedding_dim"], len(dataset.class_to_idx)).to(device)
+                  if cfg.get("aux_ce_weight", 0) else None)
     memory = (GalleryMemory(cfg["memory_size"], cfg["memory_min_classes"])
               if cfg["objective"] in {"episode", "supcon"} and cfg["memory_size"] else None)
     for p in encoder.backbone.parameters():
         p.requires_grad_(cfg["train_backbone"])
     head_parameters = list(encoder.projection.parameters()) + [
         p for p in scorer.parameters() if p.requires_grad]
+    if encoder.local_projection is not None:
+        head_parameters += list(encoder.local_projection.parameters())
     if classifier is not None:
         head_parameters += list(classifier.parameters())
     groups = [{"params": head_parameters,
@@ -792,7 +1091,10 @@ def train_variant(root, out, manifest, cfg, seed, device):
         epoch_start_time = time.perf_counter()
         sampler = EpisodeSampler(labels, cfg["ways"], cfg["support"], cfg["queries"],
                                  cfg["episodes_per_epoch"], seed + epoch * 100003,
-                                 cfg["hard_negative_probability"], groups=train_groups)
+                                 cfg["hard_negative_probability"], groups=train_groups,
+                                 scales=([image_scale(path) for path, _ in train_items]
+                                         if cfg.get("cross_scale") else None),
+                                 cross_scale=cfg.get("cross_scale", False))
         if epoch == epoch_start:
             print(f"[gallery] scan-disjoint eligible meta-train species="
                   f"{len(sampler.eligible)}", flush=True)
@@ -831,8 +1133,10 @@ def train_variant(root, out, manifest, cfg, seed, device):
               f"val24={validation['meta_val_r1_24']:.4f} "
               f"val{validation['validation_species']}="
               f"{validation['meta_val_r1_all']:.4f} "
+              f"stress={validation.get('meta_val_r1_stress', float('nan')):.4f} "
               f"ref_spread={validation['reference_embedding_spread']:.4f} "
               f"topM={top_m_episodes}/{len(losses)} max_gallery={max_gallery} "
+              f"cross_scale={sampler.cross_scale_groups}/{sampler.episode_groups} "
               f"amp_skips={skipped_steps}/{len(losses)} "
               f"train_s={train_seconds:.1f} epoch_s={epoch_seconds:.1f} "
               f"peak_gb={peak_gpu_gb}", flush=True)
@@ -860,6 +1164,8 @@ def train_variant(root, out, manifest, cfg, seed, device):
                                                                  if train_r1 else None),
                                             "top_m_episodes": top_m_episodes,
                                             "max_training_gallery_images": max_gallery,
+                                            "cross_scale_groups": sampler.cross_scale_groups,
+                                            "episode_groups": sampler.episode_groups,
                                             "amp_skipped_steps": skipped_steps,
                                             "memory_classes": 0 if memory is None else len(memory),
                                             "train_seconds": train_seconds,
@@ -907,27 +1213,43 @@ def _embedding_cache(encoder, items, cfg, device, target, checkpoint_hash):
     """Sequential .npy extraction with a checked resume cursor."""
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    use_local = bool(cfg.get("local_weight", 0))
+    local_path = target.with_name(target.stem + "_tokens.npy")
     signature = _hash_bytes(json.dumps({"checkpoint": checkpoint_hash,
                                          "image_size": cfg["image_size"],
+                                         "local": use_local,
                                          "items": items}, separators=(",", ":")).encode())
     progress_path = target.with_suffix(".progress.json")
     if progress_path.exists():
         progress = json.loads(progress_path.read_text())
-        if progress["signature"] != signature or not target.exists():
+        if (progress["signature"] != signature or not target.exists() or
+                (use_local and not local_path.exists())):
             raise ValueError(f"Stale or incomplete embedding cache at {target}")
         offset = int(progress["offset"])
         matrix = np.lib.format.open_memmap(target, mode="r+")
+        local_matrix = (np.lib.format.open_memmap(local_path, mode="r+")
+                        if use_local else None)
     else:
-        if target.exists():
+        if target.exists() or (use_local and local_path.exists()):
             raise ValueError(f"Embedding cache {target} has no provenance cursor")
         matrix = np.lib.format.open_memmap(
             target, mode="w+", dtype=np.float32, shape=(len(items), cfg["embedding_dim"]))
+        local_matrix = (np.lib.format.open_memmap(
+            local_path, mode="w+", dtype=np.float16,
+            shape=(len(items), 4 * (1 if cfg["backbone"] == "woodpattern_single_scale" else 3),
+                   cfg["local_dim"])) if use_local else None)
         offset = 0
         _json(progress_path, {"signature": signature, "offset": 0,
                               "checkpoint_sha256": checkpoint_hash, "rows": len(items)})
     if matrix.shape != (len(items), cfg["embedding_dim"]) or not 0 <= offset <= len(items):
         raise ValueError(f"Invalid embedding cache dimensions or cursor for {target}")
+    if use_local and local_matrix.shape != (
+            len(items), 4 * (1 if cfg["backbone"] == "woodpattern_single_scale" else 3),
+            cfg["local_dim"]):
+        raise ValueError(f"Invalid local-token cache dimensions for {local_path}")
     if offset == len(items):
+        if use_local and not np.isfinite(local_matrix).all():
+            raise ValueError(f"Non-finite local-token cache at {local_path}")
         print(f"[gallery] Reusing {target} ({offset} images)", flush=True)
         return np.load(target, mmap_mode="r")
     print(f"[gallery] Extracting {target.name}: {offset}/{len(items)} complete", flush=True)
@@ -937,17 +1259,25 @@ def _embedding_cache(encoder, items, cfg, device, target, checkpoint_hash):
     with torch.inference_mode():
         for batch_index, (images, _) in enumerate(loader, start=1):
             with _autocast(device):
-                embeddings = encoder(images.to(device, non_blocking=True))
-            if not torch.isfinite(embeddings).all():
+                if use_local:
+                    embeddings, local = encoder.forward_with_tokens(images.to(device, non_blocking=True))
+                else:
+                    embeddings = encoder(images.to(device, non_blocking=True))
+            if not torch.isfinite(embeddings).all() or (use_local and not torch.isfinite(local).all()):
                 raise RuntimeError(f"Non-finite embeddings while extracting {target} at row {offset}")
             n = len(images)
             matrix[offset:offset + n] = embeddings.float().cpu().numpy()
+            if use_local:
+                local_matrix[offset:offset + n] = local.float().cpu().numpy().astype(np.float16)
             offset += n
             if batch_index % interval == 0 or offset == len(items):
                 matrix.flush()
+                if use_local:
+                    local_matrix.flush()
                 _json(progress_path, {"signature": signature, "offset": offset,
                                       "checkpoint_sha256": checkpoint_hash, "rows": len(items)})
-    if offset != len(items) or not np.isfinite(matrix).all():
+    if (offset != len(items) or not np.isfinite(matrix).all() or
+            (use_local and not np.isfinite(local_matrix).all())):
         raise ValueError(f"Incomplete or non-finite embedding cache {target}")
     return np.load(target, mmap_mode="r")
 
@@ -959,9 +1289,18 @@ def macro_accuracy(predictions, labels):
     return float(np.mean([np.mean(predictions[labels == c] == c) for c in sorted(set(labels))]))
 
 
-def _predict(scorer, queries, q_labels, gallery, g_labels, device):
+def _predict(scorer, queries, q_labels, gallery, g_labels, device,
+             query_tokens=None, gallery_tokens=None, cfg=None):
     scores, classes, distance, nearest, prototype, ranked_indices = score_queries(
         scorer, queries, gallery, g_labels, device)
+    if query_tokens is not None or gallery_tokens is not None:
+        if query_tokens is None or gallery_tokens is None or cfg is None:
+            raise ValueError("Local evidence requires query/gallery tokens and a recipe")
+        evidence_scores, evidence_classes = score_queries_evidence(
+            scorer, queries, gallery, g_labels, query_tokens, gallery_tokens, cfg, device)
+        if not np.array_equal(classes, evidence_classes):
+            raise RuntimeError("Global and local class columns differ")
+        scores = evidence_scores
     predictions = classes[scores.argmax(axis=1)]
     ranked = classes[ranked_indices]
     relevance = ranked == np.asarray(q_labels)[:, None]
@@ -1033,7 +1372,7 @@ def _within_source_control(id_emb, ood_emb, id_frame, ood_frame, device):
 
 
 def _gallery_expansion(scorer, swi, swi_labels, id_emb, id_labels,
-                       ood_emb, ood_labels, ood_frame, device):
+                       ood_emb, ood_labels, ood_frame, device, token_matrices=None, cfg=None):
     counts = ood_frame.groupby("label").size().sort_values(ascending=False)
     species = counts.head(50).index.tolist()
     rng = np.random.RandomState(42)
@@ -1046,8 +1385,15 @@ def _gallery_expansion(scorer, swi, swi_labels, id_emb, id_labels,
         reference_idx.extend(indices[n_query:n_query + 10].tolist())
     gallery = np.concatenate((swi, ood_emb[reference_idx]))
     labels = np.r_[swi_labels, ood_labels[reference_idx]]
-    old = _predict(scorer, id_emb, id_labels, gallery, labels, device)
-    new = _predict(scorer, ood_emb[query_idx], ood_labels[query_idx], gallery, labels, device)
+    gallery_tokens = (np.concatenate((token_matrices["swi"],
+                                     token_matrices["ood"][reference_idx]))
+                      if token_matrices is not None else None)
+    old = _predict(scorer, id_emb, id_labels, gallery, labels, device,
+                   None if token_matrices is None else token_matrices["id"],
+                   gallery_tokens, cfg)
+    new = _predict(scorer, ood_emb[query_idx], ood_labels[query_idx], gallery, labels, device,
+                   None if token_matrices is None else token_matrices["ood"][query_idx],
+                   gallery_tokens, cfg)
     return {"old_after_r1": old["species_r1"],
             "new_species_r1": new["species_r1"],
             "old_nearest_r1": old["nearest_image_r1"],
@@ -1056,7 +1402,8 @@ def _gallery_expansion(scorer, swi, swi_labels, id_emb, id_labels,
             "new_species": len(species)}
 
 
-def _public_kshot(scorer, id_emb, id_labels, id_frame, device, repeats=30):
+def _public_kshot(scorer, id_emb, id_labels, id_frame, device, repeats=30,
+                  id_tokens=None, cfg=None):
     rng = np.random.RandomState(42)
     splits = {}
     for label in sorted(set(id_labels)):
@@ -1072,7 +1419,9 @@ def _public_kshot(scorer, id_emb, id_labels, id_frame, device, repeats=30):
             refs = np.concatenate([sample.choice(pool, min(k, len(pool)), replace=False)
                                    for _, pool in splits.values()])
             result = _predict(scorer, id_emb[query_idx], id_labels[query_idx],
-                              id_emb[refs], id_labels[refs], device)
+                              id_emb[refs], id_labels[refs], device,
+                              None if id_tokens is None else id_tokens[query_idx],
+                              None if id_tokens is None else id_tokens[refs], cfg)
             results.append({"k": k, "repeat": repeat,
                             "r1": result["species_r1"],
                             "nearest_r1": result["nearest_image_r1"],
@@ -1080,7 +1429,8 @@ def _public_kshot(scorer, id_emb, id_labels, id_frame, device, repeats=30):
     return pd.DataFrame(results)
 
 
-def _cardinality_curve(scorer, id_emb, id_labels, swi_emb, swi_items, device):
+def _cardinality_curve(scorer, id_emb, id_labels, swi_emb, swi_items, device,
+                       id_tokens=None, swi_tokens=None, cfg=None):
     by_class = defaultdict(list)
     for index, (path, label) in enumerate(swi_items):
         by_class[label].append((path, index))
@@ -1100,7 +1450,8 @@ def _cardinality_curve(scorer, id_emb, id_labels, swi_emb, swi_items, device):
         species = target + distractors[:n_species - 24]
         indices = [index for label in species for index in selected_indices[label]]
         labels = np.asarray([label for label in species for _ in range(k_refs)])
-        result = _predict(scorer, id_emb, id_labels, swi_emb[indices], labels, device)
+        result = _predict(scorer, id_emb, id_labels, swi_emb[indices], labels, device,
+                          id_tokens, None if swi_tokens is None else swi_tokens[indices], cfg)
         rows.append({"species": n_species, "references_per_species": k_refs,
                      "gallery_images": len(indices),
                      "r1": result["species_r1"],
@@ -1110,47 +1461,62 @@ def _cardinality_curve(scorer, id_emb, id_labels, swi_emb, swi_items, device):
 
 
 def _vn26_generalization(root, run_dir, encoder, scorer, cfg, checkpoint_hash,
-                         matrices, items, device):
+                         matrices, items, device, token_matrices=None):
     from .final_colab_audit import _vn26_items
     by_path = {}
     for split in ("id", "ood"):
         for index, (path, label) in enumerate(items[split]):
             if path in by_path and by_path[path][1] != label:
                 raise ValueError(f"Public image has conflicting labels: {path}")
-            by_path[path] = (np.asarray(matrices[split][index]), label)
+            by_path[path] = (np.asarray(matrices[split][index]), label,
+                             None if token_matrices is None else
+                             np.asarray(token_matrices[split][index]))
     vn26 = _vn26_items(root)
     by_mag = {}
     missing_count = 0
     for mag, rows in vn26.items():
         embeddings = [None] * len(rows)
+        tokens = [None] * len(rows) if token_matrices is not None else None
         missing_positions, missing_items = [], []
         for index, (path, label) in enumerate(rows):
             label = canonical(label)
             if path in by_path:
-                vector, public_label = by_path[path]
+                vector, public_label, local = by_path[path]
                 if label != public_label:
                     raise ValueError(f"VN26/public label conflict for {path}")
                 embeddings[index] = vector
+                if tokens is not None:
+                    tokens[index] = local
             else:
                 missing_positions.append(index)
                 missing_items.append((path, label))
         if missing_items:
+            missing_path = run_dir / "embeddings" / f"vn26_{mag}_missing.npy"
             fresh = _embedding_cache(encoder, missing_items, cfg, device,
-                                     run_dir / "embeddings" / f"vn26_{mag}_missing.npy",
-                                     checkpoint_hash)
+                                     missing_path, checkpoint_hash)
+            local_fresh = (np.load(missing_path.with_name(missing_path.stem + "_tokens.npy"),
+                                   mmap_mode="r") if tokens is not None else None)
             for position, vector in zip(missing_positions, fresh):
                 embeddings[position] = vector
+            if tokens is not None:
+                for position, local in zip(missing_positions, local_fresh):
+                    tokens[position] = local
             missing_count += len(missing_items)
         by_mag[mag] = (np.stack(embeddings).astype(np.float32),
-                       np.asarray([canonical(label) for _, label in rows]))
+                       np.asarray([canonical(label) for _, label in rows]),
+                       None if tokens is None else np.stack(tokens).astype(np.float16))
     swi_labels = np.asarray([label for _, label in items["swi"]])
     vn_embeddings = np.concatenate([by_mag[mag][0] for mag in ("x10", "x20", "x50")])
     vn_labels = np.concatenate([by_mag[mag][1] for mag in ("x10", "x20", "x50")])
     common = set(swi_labels) & set(vn_labels)
     mask_g = np.isin(swi_labels, list(common))
     mask_q = np.isin(vn_labels, list(common))
+    vn_tokens = (None if token_matrices is None else
+                 np.concatenate([by_mag[mag][2] for mag in ("x10", "x20", "x50")]))
     pool = _predict(scorer, vn_embeddings[mask_q], vn_labels[mask_q],
-                    matrices["swi"][mask_g], swi_labels[mask_g], device)
+                    matrices["swi"][mask_g], swi_labels[mask_g], device,
+                    None if vn_tokens is None else vn_tokens[mask_q],
+                    None if token_matrices is None else token_matrices["swi"][mask_g], cfg)
     cross = {}
     for gallery_mag in ("x10", "x20", "x50"):
         for query_mag in ("x10", "x20", "x50"):
@@ -1163,7 +1529,9 @@ def _vn26_generalization(root, run_dir, encoder, scorer, cfg, checkpoint_hash,
                 continue
             gm = np.isin(g_labels, list(shared))
             qm = np.isin(q_labels, list(shared))
-            result = _predict(scorer, q_emb[qm], q_labels[qm], g_emb[gm], g_labels[gm], device)
+            result = _predict(scorer, q_emb[qm], q_labels[qm], g_emb[gm], g_labels[gm], device,
+                              None if token_matrices is None else by_mag[query_mag][2][qm],
+                              None if token_matrices is None else by_mag[gallery_mag][2][gm], cfg)
             cross[f"{gallery_mag}_to_{query_mag}"] = {
                 "species": len(shared), "queries": int(qm.sum()),
                 "r1": result["species_r1"],
@@ -1207,9 +1575,13 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
         "ood": list(zip(frames["ood"]["file_path"], frames["ood"]["label"])),
     }
     matrices = {}
+    token_matrices = {} if cfg.get("local_weight", 0) else None
     for split, rows in items.items():
-        matrices[split] = _embedding_cache(
-            encoder, rows, cfg, device, run_dir / "embeddings" / f"{split}.npy", checkpoint_hash)
+        target = run_dir / "embeddings" / f"{split}.npy"
+        matrices[split] = _embedding_cache(encoder, rows, cfg, device, target, checkpoint_hash)
+        if token_matrices is not None:
+            token_matrices[split] = np.load(
+                target.with_name(target.stem + "_tokens.npy"), mmap_mode="r")
     swi_labels = np.asarray([label for _, label in items["swi"]])
     id_labels = frames["id"]["label"].to_numpy()
     ood_labels = frames["ood"]["label"].to_numpy()
@@ -1221,7 +1593,9 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
         if scope == "full_swi" and (len(swi_labels) != 176123 or len(set(swi_labels)) != 954):
             raise ValueError("954-species SWI gallery no longer matches the audited protocol")
         prediction = _predict(scorer, matrices["id"], id_labels,
-                              matrices["swi"][mask], swi_labels[mask], device)
+                              matrices["swi"][mask], swi_labels[mask], device,
+                              None if token_matrices is None else token_matrices["id"],
+                              None if token_matrices is None else token_matrices["swi"][mask], cfg)
         scopes[scope] = {k: value for k, value in prediction.items()
                          if k not in {"distance", "predictions"}}
         scopes[scope]["gallery_images"] = int(mask.sum())
@@ -1239,12 +1613,17 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
         matrices["id"], matrices["ood"], frames["id"], frames["ood"], device)
     expansion = _gallery_expansion(
         scorer, matrices["swi"][id_mask], swi_labels[id_mask], matrices["id"], id_labels,
-        matrices["ood"], ood_labels, frames["ood"], device)
-    kshot = _public_kshot(scorer, matrices["id"], id_labels, frames["id"], device, repeats)
+        matrices["ood"], ood_labels, frames["ood"], device,
+        None if token_matrices is None else {**token_matrices,
+            "swi": token_matrices["swi"][id_mask]}, cfg)
+    kshot = _public_kshot(scorer, matrices["id"], id_labels, frames["id"], device, repeats,
+                          None if token_matrices is None else token_matrices["id"], cfg)
     cardinality = _cardinality_curve(scorer, matrices["id"], id_labels,
-                                     matrices["swi"], items["swi"], device)
+                                     matrices["swi"], items["swi"], device,
+                                     None if token_matrices is None else token_matrices["id"],
+                                     None if token_matrices is None else token_matrices["swi"], cfg)
     vn26 = (_vn26_generalization(root, run_dir, encoder, scorer, cfg, checkpoint_hash,
-                                 matrices, items, device)
+                                 matrices, items, device, token_matrices)
             if os.environ.get("GALLERY_STUDY_EVAL_VN26", "1") == "1" else None)
     kshot.to_csv(run_dir / "kshot_repeats.csv", index=False)
     cardinality.to_csv(run_dir / "cardinality_curve.csv", index=False)
@@ -1258,6 +1637,7 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
               "backbone_initialization": ("random" if cfg["backbone"].startswith("woodpattern_")
                                            else "pretrained"),
               "dino_repo_ref": DINO_REPO_REF if cfg["backbone"].startswith("dinov2_") else None,
+              "dino_v3_repo_ref": DINO_V3_REPO_REF if cfg["backbone"].startswith("dinov3_") else None,
               "backbone_parameters": sum(p.numel() for p in encoder.backbone.parameters()),
               "torch_version": torch.__version__, "device": str(device),
               "manifest_sha256": _hash_file(root / "swi_manifest.json"),
@@ -1275,6 +1655,10 @@ def evaluate_variant(root, out, manifest, cfg, seed, device, repeats=30):
                   "swi_training_and_validation": "source-scan-disjoint support/query by patch filename",
                   "public_kshot": "unverified: public source-specimen IDs unavailable"},
               "caution": "Public data informed study design; this is not an untouched confirmatory test."}
+    report["score_protocol"] = {
+        "species_r1": "global-plus-local-shortlist" if token_matrices is not None else "global",
+        "image_map_mrr": "global-image-embedding ranking",
+        "ood_rejection": "global nearest-image distance"}
     _json(run_dir / "evaluation.json", report)
     return report
 
@@ -1283,9 +1667,9 @@ def run():
     root = Path(os.environ.get("ROOT_PATH", "/content/drive/MyDrive/NCS")).resolve()
     out = Path(os.environ.get("GALLERY_STUDY_OUT", root / "results" / "metric_retrieval_study")).resolve()
     mode = os.environ.get("GALLERY_STUDY_MODE", "pilot").lower()
-    if mode not in {"smoke", "backbone_smoke", "preflight", "pilot", "warmup", "train", "evaluate"}:
+    if mode not in {"smoke", "backbone_smoke", "preflight", "pilot", "warmup", "train", "screen", "evaluate"}:
         raise ValueError("GALLERY_STUDY_MODE must be smoke, backbone_smoke, preflight, pilot, "
-                         "warmup, train, or evaluate")
+                         "warmup, train, screen, or evaluate")
     device = torch.device("cuda" if os.environ.get("DEVICE", "cuda") == "cuda" and
                           torch.cuda.is_available() else "cpu")
     if mode == "smoke":
@@ -1295,10 +1679,12 @@ def run():
             raise RuntimeError("Backbone smoke test requires CUDA")
         backbone = os.environ.get("GALLERY_STUDY_BACKBONE", "dinov2_vitb14").lower()
         return smoke_test(device, real_backbone=True, backbone=backbone)
-    if device.type != "cuda" and mode in {"pilot", "warmup", "train"}:
+    if device.type != "cuda" and mode in {"pilot", "warmup", "train", "screen"}:
         raise RuntimeError("Full-backbone training requires a CUDA runtime")
     pilot = mode == "pilot" or os.environ.get("GALLERY_STUDY_PILOT_CHECKPOINTS", "0") == "1"
     default_variants = ("supervised_warmup" if mode == "warmup" else
+                        "metric_large,metric_large_ce,metric_large_scale,prototype_large,local_evidence"
+                        if mode == "screen" else
                         "metric_retrieval,prototype_retrieval" if mode == "pilot" else
                         "metric_retrieval")
     variants = [name.strip() for name in os.environ.get("GALLERY_STUDY_VARIANTS", default_variants).split(",")]
@@ -1346,12 +1732,57 @@ def run():
         for seed in seeds:
             if mode == "warmup":
                 train_supervised_warmup(root, out, manifest, cfg, seed, device)
-            elif mode in {"pilot", "train"}:
+            elif mode in {"pilot", "train", "screen"}:
                 train_variant(root, out, manifest, cfg, seed, device)
             else:
                 reports.append(evaluate_variant(
                     root, out, manifest, cfg, seed, device,
                     repeats=int(os.environ.get("GALLERY_STUDY_KSHOT_REPEATS", "30"))))
+    if mode == "screen":
+        rows = []
+        for variant in variants:
+            cfg = variant_config(variant, pilot=pilot)
+            for seed in seeds:
+                path = out / cfg["backbone"] / variant / f"seed_{seed}" / "best.pt"
+                checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+                if checkpoint["signature"] != _run_signature(root, cfg, seed):
+                    raise ValueError(f"Screening checkpoint provenance mismatch: {path}")
+                val = checkpoint["validation"]
+                rows.append({"backbone": cfg["backbone"], "variant": variant,
+                             "seed": seed, "epoch": checkpoint["epoch"],
+                             "image_size": cfg["image_size"],
+                             "runner_sha256": _hash_file(__file__),
+                             "model_sha256": _hash_file(Path(__file__).with_name("gallery_method.py")),
+                             "wood_encoder_sha256": _hash_file(Path(__file__).with_name("wood_encoder.py")),
+                             "val24_r1": val["meta_val_r1_24"],
+                             "val_all_r1": val["meta_val_r1_all"],
+                             "val_stress_r1": val.get("meta_val_r1_stress"),
+                             "stress_gallery_species": val.get("stress_gallery_species"),
+                             "selection_score": val["selection_score"],
+                             "reference_spread": val["reference_embedding_spread"],
+                             "folds": cfg["validation_folds"],
+                             "checkpoint_sha256": _hash_file(path)})
+        table = pd.DataFrame(rows)
+        screen_path = out / "meta_val_screen.csv"
+        if screen_path.exists():
+            previous = pd.read_csv(screen_path)
+            for name in ("runner_sha256", "model_sha256", "wood_encoder_sha256", "folds",
+                         "image_size",
+                         "stress_gallery_species"):
+                if name not in previous or set(previous[name].dropna()) != set(table[name].dropna()):
+                    raise ValueError(f"Cannot merge screening runs with incompatible {name}")
+            table = pd.concat((previous, table), ignore_index=True)
+            table = table.drop_duplicates(["backbone", "variant", "seed", "image_size"], keep="last")
+        table.sort_values(["backbone", "variant", "seed", "image_size"]).to_csv(
+            screen_path, index=False)
+        metrics = ["val24_r1", "val_all_r1", "val_stress_r1", "selection_score",
+                   "reference_spread"]
+        aggregate = table.groupby(["backbone", "variant"])[metrics].agg(["mean", "std", "count"])
+        aggregate.columns = [f"{metric}_{stat}" for metric, stat in aggregate.columns]
+        aggregate.to_csv(out / "meta_val_screen_summary.csv")
+        _json(out / "meta_val_screen_manifest.json", {
+            "status": "exploratory_meta_validation_only", "rows": len(table),
+            "public_test_used": False})
     if reports:
         by_run = {(report["backbone"], report["variant"], report["seed"]): report
                   for report in reports}
@@ -1368,6 +1799,7 @@ def run():
             rows.append({"variant": report["variant"], "backbone": report["backbone"],
                          "seed": report["seed"],
                          "meta_val_selection": report["selection"]["selection_score"],
+                         "meta_val_stress_r1": report["selection"].get("meta_val_r1_stress"),
                          "id24_r1": report["scopes"]["id_only"]["species_r1"],
                          "matched954_r1": report["scopes"]["full_swi"]["species_r1"],
                          "id24_map100": report["scopes"]["id_only"]["image_map_at_100"],

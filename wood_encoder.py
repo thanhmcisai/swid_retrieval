@@ -67,7 +67,7 @@ class WoodPatternNet(nn.Module):
             *(TextureBlock(out_channels) for _ in range(blocks)),
         )
 
-    def forward(self, x):
+    def _encode(self, x, return_tokens):
         x = self.stem(x)
         second = self.stage2(x)
         third = self.stage3(second)
@@ -88,4 +88,18 @@ class WoodPatternNet(nn.Module):
             pooled = tokens.mean(dim=1)
         mean = tokens.mean(dim=1)
         dispersion = tokens.var(dim=1, unbiased=False).add(1e-6).sqrt()
-        return self.output(torch.cat((pooled, mean, dispersion), dim=1))
+        features = self.output(torch.cat((pooled, mean, dispersion), dim=1))
+        if not return_tokens:
+            return features
+        # Keep a small, spatially unordered tissue-evidence set for shortlist matching.
+        local = tokens.reshape(len(tokens), len(scales), 4, 4, 128)
+        local = local.permute(0, 1, 4, 2, 3).reshape(-1, 128, 4, 4)
+        local = F.adaptive_avg_pool2d(local, (2, 2)).reshape(len(tokens), len(scales), 128, 4)
+        local = local.permute(0, 1, 3, 2).reshape(len(tokens), 4 * len(scales), 128)
+        return features, local
+
+    def forward_with_tokens(self, x):
+        return self._encode(x, True)
+
+    def forward(self, x):
+        return self._encode(x, False)

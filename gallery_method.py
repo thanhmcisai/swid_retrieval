@@ -12,13 +12,15 @@ from torch.nn import functional as F
 
 
 class GalleryEncoder(nn.Module):
-    def __init__(self, backbone, feature_dim=768, embedding_dim=512):
+    def __init__(self, backbone, feature_dim=768, embedding_dim=512, local_dim=0):
         super().__init__()
         self.backbone = backbone
         self.projection = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, embedding_dim),
         )
+        self.local_projection = (nn.Sequential(nn.LayerNorm(128), nn.Linear(128, local_dim))
+                                 if local_dim else None)
 
     def project(self, features):
         with torch.autocast(device_type=features.device.type, enabled=False):
@@ -27,6 +29,35 @@ class GalleryEncoder(nn.Module):
 
     def forward(self, images):
         return self.project(self.backbone(images))
+
+    def project_tokens(self, tokens):
+        if self.local_projection is None:
+            raise ValueError("Local evidence is not enabled for this encoder")
+        with torch.autocast(device_type=tokens.device.type, enabled=False):
+            return F.normalize(self.local_projection(tokens.float()), dim=-1, eps=1e-6)
+
+    def forward_with_tokens(self, images):
+        features, tokens = self.backbone.forward_with_tokens(images)
+        return self.project(features), self.project_tokens(tokens)
+
+
+def local_pair_similarity(query_tokens, reference_tokens):
+    """Symmetric soft spatially unordered match of two small tissue-token sets."""
+    if (query_tokens.ndim != 3 or reference_tokens.ndim != 3 or
+            query_tokens.shape[-1] != reference_tokens.shape[-1]):
+        raise ValueError("Expected query [Q,T,D] and reference [R,T,D] tokens")
+    affinity = torch.einsum("qtd,rsd->qrts", query_tokens.float(), reference_tokens.float())
+    return (affinity.max(dim=3).values.mean(dim=2) +
+            affinity.max(dim=2).values.mean(dim=2)) / 2
+
+
+def local_species_scores(query_tokens, reference_tokens, reference_labels, temperature):
+    classes, inverse = torch.unique(reference_labels.long(), sorted=True, return_inverse=True)
+    pair = local_pair_similarity(query_tokens, reference_tokens) / temperature
+    scores = pair.new_full((len(query_tokens), len(classes)), -torch.inf)
+    scores.scatter_reduce_(1, inverse[None].expand(len(query_tokens), -1),
+                           pair, reduce="amax", include_self=True)
+    return scores, classes
 
 
 class GalleryMemory:

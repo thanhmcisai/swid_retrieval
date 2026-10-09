@@ -157,7 +157,231 @@ class GalleryMethodTest(unittest.TestCase):
         self.assertFalse(set(path for path, _ in refs) & set(path for path, _ in queries))
 
     def test_synthetic_full_backbone_step(self):
+        if not hasattr(self.torch.amp, "GradScaler"):
+            self.skipTest("Local PyTorch lacks torch.amp.GradScaler; Colab has it")
         self.experiment.smoke_test(self.torch.device("cpu"))
+
+    def test_cross_scale_sampler_keeps_scan_disjoint_positives(self):
+        items = [(f"scale_{scale}/patch_{scale}_{i}_from_Tw{100 + 2 * species + scan}.jpg",
+                  f"genus_{species}")
+                 for species in range(4) for scan, scale in enumerate((256, 512))
+                 for i in range(3)]
+        labels = [label for _, label in items]
+        groups = [self.experiment.source_scan_id(path) for path, _ in items]
+        scales = [self.experiment.image_scale(path) for path, _ in items]
+        sampler = self.experiment.EpisodeSampler(labels, (4,), 2, 1, 8, 42,
+                                                 groups=groups, scales=scales,
+                                                 cross_scale=True)
+        for indices in sampler:
+            support, queries = indices[:8], indices[8:]
+            for species in range(4):
+                refs = support[species * 2:species * 2 + 2]
+                query = queries[species]
+                self.assertTrue(all(groups[ref] != groups[query] for ref in refs))
+                self.assertTrue(all(scales[ref] != scales[query] for ref in refs))
+
+    def test_frontier_recipes_are_isolated_and_dinov3_requires_weights(self):
+        with patch.dict(os.environ, {"GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
+                                  "GALLERY_STUDY_INIT_CHECKPOINT": "",
+                                  "GALLERY_STUDY_VALIDATION_TRAIN_DISTRACTORS": "1"}):
+            large = self.experiment.variant_config("metric_large")
+            local = self.experiment.variant_config("local_evidence")
+            mixed = self.experiment.variant_config("local_evidence_ce_scale")
+        self.assertEqual(large["ways"], (16, 32, 64))
+        self.assertEqual(large["memory_size"], 0)
+        self.assertEqual(local["local_weight"], 0.35)
+        self.assertTrue(mixed["cross_scale"])
+        self.assertEqual(local["validation_train_distractors"], 1)
+        with patch.dict(os.environ, {"GALLERY_STUDY_BACKBONE": "dinov3_vits16",
+                                  "GALLERY_STUDY_DINOV3_WEIGHTS": "",
+                                  "GALLERY_STUDY_INIT_CHECKPOINT": ""}):
+            with self.assertRaisesRegex(FileNotFoundError, "licensed local"):
+                self.experiment.variant_config("pretrained_control")
+
+    def test_local_shortlist_reranks_and_backpropagates(self):
+        torch, np = self.torch, self.np
+        scorer = self.method.GalleryScorer(mode="nearest")
+        vectors = np.asarray([[1., 0.], [1., 0.]], dtype=np.float32)
+        qt = np.asarray([[[1., 0.], [1., 0.]]], dtype=np.float32)
+        rt = np.asarray([[[0., 1.], [0., 1.]], [[1., 0.], [1., 0.]]], dtype=np.float16)
+        cfg = {"local_candidates": 2, "local_refs_per_species": 1,
+               "temperature": 0.07, "local_weight": 0.5}
+        scores, classes = self.experiment.score_queries_evidence(
+            scorer, vectors[:1], vectors, ["a", "b"], qt, rt, cfg, torch.device("cpu"))
+        self.assertEqual(classes[scores.argmax(1)].tolist(), ["b"])
+
+        class TinyBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.global_linear = torch.nn.Linear(12, 8)
+                self.local_linear = torch.nn.Linear(12, 256)
+
+            def forward_with_tokens(self, images):
+                flat = images.flatten(1)
+                return self.global_linear(flat), self.local_linear(flat).reshape(-1, 2, 128)
+
+            def forward(self, images):
+                return self.global_linear(images.flatten(1))
+
+        class CPUScaler:
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, optimizer):
+                pass
+
+            def step(self, optimizer):
+                optimizer.step()
+
+            def update(self):
+                pass
+
+            def get_scale(self):
+                return 1.0
+
+            def is_enabled(self):
+                return False
+
+        encoder = self.method.GalleryEncoder(TinyBackbone(), 8, 4, local_dim=8)
+        classifier = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(list(encoder.parameters()) +
+                                      list(classifier.parameters()), lr=1e-2)
+        cfg.update({"support": 2, "queries": 1, "microbatch": 4,
+                    "train_backbone": True, "objective": "episode", "variable_gallery": False,
+                    "stability_weight": 0.0, "pseudo_ood_weight": 0.0,
+                    "positive_weight": 0.1, "aux_ce_weight": 0.2})
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 0, 1, 2, 3])
+        before = encoder.backbone.local_linear.weight.detach().clone()
+        loss, details = self.experiment._episode_step(
+            torch.randn(12, 3, 2, 2), labels, cfg, encoder, scorer, optimizer,
+            CPUScaler(), torch.device("cpu"), classifier=classifier)
+        self.assertTrue(np.isfinite(loss))
+        self.assertIn("aux_ce", details)
+        self.assertFalse(torch.equal(before, encoder.backbone.local_linear.weight))
+
+    def test_meta_val_stress_uses_balanced_references_without_public_images(self):
+        np, torch = self.np, self.torch
+        manifest = {"meta-train": [(f"patch_256_0_from_Tw{100 + i}.jpg", f"train_{i}")
+                                   for i in range(4)],
+                    "meta-val": [(f"patch_256_{j}_from_Tw{1000 + 2 * i + scan}.jpg",
+                                  f"val_{i}") for i in range(24) for scan in range(2)
+                                 for j in range(5)]}
+        label_order = sorted({label for split in manifest.values() for _, label in split})
+        lookup = {label: i for i, label in enumerate(label_order)}
+
+        def fake_encode(_encoder, items, _cfg, _device):
+            matrix = np.zeros((len(items), len(lookup)), np.float32)
+            for row, (_, label) in enumerate(items):
+                matrix[row, lookup[label]] = 1
+            return matrix
+
+        cfg = {"group_mode": "scan_disjoint", "validation_folds": 2,
+               "validation_train_distractors": 1, "local_weight": 0}
+        with patch.object(self.experiment, "encode_items", side_effect=fake_encode):
+            result = self.experiment._validation(None, self.method.GalleryScorer(mode="nearest"),
+                                                 manifest, cfg, torch.device("cpu"))
+        self.assertEqual(result["stress_gallery_species"], 28)
+        self.assertEqual(result["stress_gallery_images"], 28)
+        self.assertEqual(result["validation_folds"], 2)
+        self.assertEqual(result["meta_val_r1_stress"], 1.0)
+        self.assertEqual(result["selection_score"], 1.0)
+        cfg.update({"local_weight": 0.35, "local_candidates": 8,
+                    "local_refs_per_species": 2, "temperature": 0.07})
+
+        def fake_local(encoder, items, recipe, device):
+            global_emb = fake_encode(encoder, items, recipe, device)
+            return global_emb, np.repeat(global_emb[:, None, :], 12, axis=1)
+
+        with patch.object(self.experiment, "encode_items_with_tokens", side_effect=fake_local):
+            local = self.experiment._validation_once(
+                None, self.method.GalleryScorer(mode="nearest"), manifest, cfg,
+                torch.device("cpu"), fold=0)
+        self.assertEqual(local["stress_gallery_species"], 28)
+        self.assertEqual(local["selection_score"], 1.0)
+
+    def test_local_embedding_cache_resumes_with_aligned_tokens(self):
+        torch, np = self.torch, self.np
+
+        class TinyEncoder(torch.nn.Module):
+            def forward_with_tokens(self, images):
+                return torch.nn.functional.normalize(images[:, :2], dim=1), images[:, None, :8].repeat(1, 4, 1)
+
+        def fake_loader(items, _cfg):
+            yield torch.arange(len(items) * 8, dtype=torch.float32).reshape(len(items), 8) + 1, None
+
+        cfg = {"image_size": 224, "embedding_dim": 2, "backbone": "woodpattern_single_scale",
+               "local_dim": 8, "local_weight": 0.35}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "embeddings.npy"
+            items = [("a.jpg", "a"), ("b.jpg", "b")]
+            with patch.object(self.experiment, "_loader", side_effect=fake_loader):
+                first = self.experiment._embedding_cache(
+                    TinyEncoder(), items, cfg, torch.device("cpu"), target, "hash")
+            second = self.experiment._embedding_cache(
+                TinyEncoder(), items, cfg, torch.device("cpu"), target, "hash")
+            tokens = np.load(target.with_name("embeddings_tokens.npy"))
+            self.assertEqual(first.shape, (2, 2))
+            self.assertTrue(np.array_equal(first, second))
+            self.assertEqual(tokens.shape, (2, 4, 8))
+            self.assertEqual(tokens.dtype, np.float16)
+
+    def test_local_encoder_accepts_only_local_head_missing_from_warmup(self):
+        torch = self.torch
+        source = self.method.GalleryEncoder(torch.nn.Linear(4, 8), 8, 4)
+        target = self.method.GalleryEncoder(torch.nn.Linear(4, 8), 8, 4, local_dim=8)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "swi_manifest.json").write_text("{}")
+            checkpoint = root / "warmup.pt"
+            torch.save({"checkpoint_kind": "supervised_warmup", "seed": 42, "epoch": 1,
+                        "manifest_sha256": self.experiment._hash_file(root / "swi_manifest.json"),
+                        "config": {"backbone": "woodpattern_tiny", "embedding_dim": 4},
+                        "encoder": source.state_dict()}, checkpoint)
+            cfg = {"variant": "local_evidence", "backbone": "woodpattern_tiny",
+                   "embedding_dim": 4, "local_weight": 0.35,
+                   "init_checkpoint": str(checkpoint),
+                   "init_checkpoint_sha256": self.experiment._hash_file(checkpoint)}
+            self.experiment._load_warmup_encoder(root, cfg, 42, target)
+            self.assertTrue(torch.equal(source.backbone.weight, target.backbone.weight))
+
+    def test_woodpattern_local_episode_replays_backbone_gradients(self):
+        torch = self.torch
+        from swid_retrieval.wood_encoder import WoodPatternNet
+
+        class CPUScaler:
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, optimizer):
+                pass
+
+            def step(self, optimizer):
+                optimizer.step()
+
+            def update(self):
+                pass
+
+            def get_scale(self):
+                return 1.0
+
+            def is_enabled(self):
+                return False
+
+        backbone = WoodPatternNet()
+        encoder = self.method.GalleryEncoder(backbone, backbone.num_features, 32, local_dim=16)
+        scorer = self.method.GalleryScorer(mode="nearest")
+        optimizer = torch.optim.AdamW(encoder.parameters(), lr=1e-3)
+        before = backbone.stem[0].weight.detach().clone()
+        cfg = {"support": 2, "queries": 1, "microbatch": 3, "train_backbone": True,
+               "objective": "episode", "variable_gallery": False,
+               "local_weight": 0.35, "temperature": 0.07,
+               "positive_weight": 0, "aux_ce_weight": 0}
+        loss, details = self.experiment._episode_step(
+            torch.randn(6, 3, 64, 64), torch.tensor([0, 0, 1, 1, 0, 1]),
+            cfg, encoder, scorer, optimizer, CPUScaler(), torch.device("cpu"))
+        self.assertTrue(self.np.isfinite(loss))
+        self.assertEqual(details["gallery_images"], 4)
+        self.assertFalse(torch.equal(before, backbone.stem[0].weight))
 
     def test_supervised_warmup_updates_encoder_and_checks_source(self):
         torch = self.torch

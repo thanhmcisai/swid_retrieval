@@ -73,6 +73,22 @@ class WoodGalleryTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(backbone.stem[0].weight.grad).all())
             self.assertGreater(float(backbone.stem[0].weight.grad.abs().sum()), 0)
 
+    def test_local_tokens_and_species_scores_backpropagate(self):
+        from swid_retrieval.wood_encoder import WoodPatternNet
+        from swid_retrieval.gallery_method import GalleryEncoder, local_species_scores
+        backbone = WoodPatternNet()
+        encoder = GalleryEncoder(backbone, backbone.num_features, 32, local_dim=16)
+        global_emb, tokens = encoder.forward_with_tokens(torch.randn(3, 3, 64, 64))
+        self.assertEqual(tuple(global_emb.shape), (3, 32))
+        self.assertEqual(tuple(tokens.shape), (3, 12, 16))
+        self.assertTrue(torch.allclose(tokens.norm(dim=-1), torch.ones(3, 12), atol=1e-5))
+        scores, classes = local_species_scores(tokens[2:], tokens[:2],
+                                               torch.tensor([3, 8]), 0.07)
+        self.assertEqual(classes.tolist(), [3, 8])
+        torch.nn.functional.cross_entropy(scores, torch.tensor([0])).backward()
+        self.assertGreater(float(encoder.local_projection[1].weight.grad.abs().sum()), 0)
+        self.assertGreater(float(backbone.stem[0].weight.grad.abs().sum()), 0)
+
     def test_memory_triggers_top_m_and_excludes_active_species(self):
         from swid_retrieval.gallery_method import (GalleryMemory, GalleryScorer,
                                                    episode_objective)
