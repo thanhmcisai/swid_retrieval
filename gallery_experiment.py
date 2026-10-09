@@ -767,6 +767,25 @@ def train_variant(root, out, manifest, cfg, seed, device):
         epoch_start = int(state["epoch"]) + 1
         best_score = float(state["best_score"])
         print(f"[gallery] Resuming {cfg['variant']} seed={seed} at epoch {epoch_start}", flush=True)
+    elif cfg.get("init_checkpoint"):
+        initial_validation = _validation(encoder, scorer, manifest, cfg, device)
+        best_score = float(initial_validation["selection_score"])
+        if not np.isfinite(best_score):
+            raise RuntimeError("Non-finite warm-up initialization validation score")
+        _save_checkpoint(best, {
+            "signature": signature, "config": cfg, "seed": seed, "epoch": 0,
+            "best_score": best_score, "validation": initial_validation,
+            "initial_backbone_sha256": initial_backbone_sha256,
+            "encoder": encoder.state_dict(), "scorer": scorer.state_dict(),
+            "classifier": None if classifier is None else classifier.state_dict()})
+        _json(run_dir / "best_validation.json", {
+            "signature": signature, "epoch": 0, "validation": initial_validation})
+        print(f"[gallery] {cfg['variant']} seed={seed} epoch=0/{cfg['epochs']} "
+              f"val24={initial_validation['meta_val_r1_24']:.4f} "
+              f"val{initial_validation['validation_species']}="
+              f"{initial_validation['meta_val_r1_all']:.4f} "
+              f"ref_spread={initial_validation['reference_embedding_spread']:.4f} "
+              "(warm-up initialization)", flush=True)
     for epoch in range(epoch_start, cfg["epochs"] + 1):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)

@@ -290,6 +290,80 @@ class GalleryMethodTest(unittest.TestCase):
             self.assertTrue((best.parent / "progress.json").exists())
             self.assertTrue((best.parent / "best_validation.json").exists())
 
+    def test_metric_finetune_keeps_warmup_if_training_degrades(self):
+        torch = self.torch
+
+        class TinyDataset(torch.utils.data.Dataset):
+            def __init__(self, items, transform=None):
+                self.samples = list(items)
+                self.class_to_idx = {name: i for i, name in enumerate(sorted({y for _, y in items}))}
+
+            def __len__(self):
+                return len(self.samples)
+
+            def __getitem__(self, index):
+                _, label = self.samples[index]
+                return torch.randn(3, 2, 2), self.class_to_idx[label]
+
+        class CPUScaler:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, optimizer):
+                pass
+
+            def step(self, optimizer):
+                optimizer.step()
+
+            def update(self):
+                pass
+
+            def get_scale(self):
+                return 1.0
+
+            def is_enabled(self):
+                return False
+
+            def state_dict(self):
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "swi_manifest.json").write_text("{}")
+            items = [(f"patch_256_{j}_{species}_from_Tw{1000 + 2 * species + (j == 2)}.jpg",
+                      f"genus_{species}") for species in range(16) for j in range(3)]
+            manifest = {"meta-train": items}
+            with patch.dict(os.environ, {"GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
+                                      "GALLERY_STUDY_INIT_CHECKPOINT": "",
+                                      "GALLERY_STUDY_PRELOAD": "0"}):
+                cfg = self.experiment.variant_config("metric_no_memory")
+            cfg.update({"init_checkpoint": "warmup.pt", "init_checkpoint_sha256": "test",
+                        "epochs": 1, "episodes_per_epoch": 1, "ways": (4,), "workers": 0,
+                        "microbatch": 12, "image_size": 2})
+            encoder = self.method.GalleryEncoder(
+                torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(12, 8)),
+                feature_dim=8, embedding_dim=cfg["embedding_dim"])
+            scorer = self.method.GalleryScorer(mode="nearest")
+            validations = [{"selection_score": score, "meta_val_r1_24": score,
+                            "meta_val_r1_all": score, "validation_species": 57,
+                            "reference_embedding_spread": 0.5} for score in (0.5, 0.1)]
+            with patch.object(self.experiment.data, "ManifestDataset", TinyDataset), \
+                    patch.object(self.experiment.data, "get_transforms", return_value=None), \
+                    patch.object(self.experiment, "_model", return_value=(encoder, scorer)), \
+                    patch.object(self.experiment, "_load_warmup_encoder"), \
+                    patch.object(self.experiment, "_validation", side_effect=validations), \
+                    patch.object(torch.amp, "GradScaler", CPUScaler, create=True):
+                best = self.experiment.train_variant(
+                    root, root / "results", manifest, cfg, 42, torch.device("cpu"))
+            selected = torch.load(best, map_location="cpu", weights_only=False)
+            self.assertEqual(selected["epoch"], 0)
+            self.assertEqual(selected["validation"]["selection_score"], 0.5)
+            self.assertEqual(self.experiment.json.loads(
+                (best.parent / "best_validation.json").read_text())["epoch"], 0)
+
     def test_smoke_retries_after_amp_skips(self):
         torch = self.torch
 

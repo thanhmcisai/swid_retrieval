@@ -182,7 +182,9 @@ For a subsequent **separate** metric pilot, set `GALLERY_STUDY_MODE=train`,
 `GALLERY_STUDY_INIT_CHECKPOINT` to the warm-up `best.pt`. Use a new
 `GALLERY_STUDY_OUT` so the uninitialized checkpoints are never reused. The
 runner checks the warm-up seed, backbone, embedding dimension, manifest hash,
-and checkpoint file hash before training.
+and checkpoint file hash before training. The metric run evaluates and saves
+the warm-up initialization as epoch 0, so fine-tuning is selected only if it
+improves the pre-fine-tuning meta-validation score.
 
 ## Colab setup
 
