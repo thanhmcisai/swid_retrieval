@@ -35,6 +35,9 @@ VARIANTS = {
                            "train_backbone": False, "scorer_mode": "prototype"},
     "metric_retrieval": {"scorer_mode": "nearest", "variable_gallery": False,
                          "stability_weight": 0.0, "pseudo_ood_weight": 0.0},
+    "metric_no_memory": {"scorer_mode": "nearest", "variable_gallery": False,
+                         "stability_weight": 0.0, "pseudo_ood_weight": 0.0,
+                         "memory_size": 0, "memory_min_classes": 0},
     "prototype_retrieval": {"scorer_mode": "prototype", "variable_gallery": False,
                             "stability_weight": 0.0, "pseudo_ood_weight": 0.0},
     "metric_expansion": {"scorer_mode": "nearest"},
@@ -341,6 +344,8 @@ def encode_items(encoder, items, cfg, device):
         for images, _ in _loader(items, cfg):
             with _autocast(device):
                 output = encoder(images.to(device, non_blocking=True))
+            if not torch.isfinite(output).all():
+                raise RuntimeError("Non-finite validation embeddings; checkpoint was not advanced")
             outputs.append(output.float().cpu().numpy())
     return np.concatenate(outputs) if outputs else np.empty((0, cfg["embedding_dim"]), np.float32)
 
@@ -370,30 +375,43 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
             with _autocast(device):
                 features.append(encoder.backbone(chunk).float())
     features = torch.cat(features).detach().requires_grad_(cfg["train_backbone"])
-    with _autocast(device):
-        embeddings = encoder.project(features)
-        if cfg["objective"] == "arcface":
-            loss = classifier(embeddings, batch_labels.to(device))
-            details = {"arcface": float(loss.detach())}
-        elif cfg["objective"] == "supcon":
-            labels = torch.arange(n_way, device=device).repeat_interleave(cfg["support"])
-            query_labels = torch.arange(n_way, device=device).repeat_interleave(cfg["queries"])
-            background = (memory.distractors(support_labels, n_way, device)
-                          if memory is not None else None)
-            loss = supervised_contrastive_loss(
-                embeddings, torch.cat((labels, query_labels)),
-                background=None if background is None else background[0])
-            details = {"supcon": float(loss.detach()),
-                       "memory_negatives": 0 if background is None else len(background[0])}
-        else:
-            background = (memory.distractors(support_labels, n_way, device)
-                          if memory is not None else None)
-            loss, details = episode_objective(
-                embeddings, scorer, n_way, cfg["support"], cfg["queries"],
-                cfg["stability_weight"], cfg["variable_gallery"],
-                cfg["pseudo_ood_weight"], background=background)
+    if not torch.isfinite(features).all():
+        raise RuntimeError("Non-finite backbone features before gallery loss; checkpoint was not advanced")
+    embeddings = encoder.project(features)
+    if not torch.isfinite(embeddings).all():
+        raise RuntimeError("Non-finite projected embeddings before gallery loss; checkpoint was not advanced")
+    background = None
+    if cfg["objective"] == "arcface":
+        loss = classifier(embeddings, batch_labels.to(device))
+        details = {"arcface": float(loss.detach())}
+    elif cfg["objective"] == "supcon":
+        labels = torch.arange(n_way, device=device).repeat_interleave(cfg["support"])
+        query_labels = torch.arange(n_way, device=device).repeat_interleave(cfg["queries"])
+        background = (memory.distractors(support_labels, n_way, device)
+                      if memory is not None else None)
+        loss = supervised_contrastive_loss(
+            embeddings, torch.cat((labels, query_labels)),
+            background=None if background is None else background[0])
+        details = {"supcon": float(loss.detach()),
+                   "memory_negatives": 0 if background is None else len(background[0])}
+    else:
+        background = (memory.distractors(support_labels, n_way, device)
+                      if memory is not None else None)
+        if background is not None and not torch.isfinite(background[0]).all():
+            raise RuntimeError("Non-finite gallery memory before loss; checkpoint was not advanced")
+        loss, details = episode_objective(
+            embeddings, scorer, n_way, cfg["support"], cfg["queries"],
+            cfg["stability_weight"], cfg["variable_gallery"],
+            cfg["pseudo_ood_weight"], background=background)
     if not torch.isfinite(loss):
-        raise RuntimeError("Non-finite gallery training loss; checkpoint was not advanced")
+        feature_finite = bool(torch.isfinite(features).all())
+        embedding_finite = bool(torch.isfinite(embeddings).all())
+        memory_finite = (None if background is None else
+                         bool(torch.isfinite(background[0]).all()))
+        raise RuntimeError(
+            f"Non-finite gallery training loss: feature_finite={feature_finite}, "
+            f"embedding_finite={embedding_finite}, memory_finite={memory_finite}, "
+            f"episode_ways={n_way}; checkpoint was not advanced")
     scaler.scale(loss).backward()
     if cfg["train_backbone"]:
         feature_grad = features.grad.detach()
@@ -413,7 +431,7 @@ def _episode_step(images, batch_labels, cfg, encoder, scorer, optimizer, scaler,
     details["grad_norm"] = float(grad_norm.detach())
     details["amp_scale"] = scale_after
     details["optimizer_step_skipped"] = bool(scaler.is_enabled() and scale_after < scale_before)
-    if memory is not None:
+    if memory is not None and not details["optimizer_step_skipped"]:
         memory.add(embeddings[:n_support], support_labels)
         details["memory_classes"] = len(memory)
     return float(loss.detach()), details
@@ -436,6 +454,8 @@ def score_queries(scorer, query, references, reference_labels, device,
             current, columns = scorer(q, g, gl, similarity=similarity)
             if not torch.equal(columns, torch.arange(len(classes), device=device)):
                 raise ValueError("Gallery scorer omitted a class")
+            if not torch.isfinite(current).all() or not torch.isfinite(similarity).all():
+                raise RuntimeError("Non-finite gallery scores or image similarities")
             scores.append(current.float().cpu().numpy())
             ranked_sims, ranked = similarity.topk(min(rank_k, len(g)), dim=1)
             nearest_sim, nearest_index = ranked_sims[:, 0], ranked[:, 0]
@@ -463,6 +483,7 @@ def _validation(encoder, scorer, manifest, cfg, device):
         manifest, group_mode=cfg["group_mode"])
     refs = encode_items(encoder, reference_items, cfg, device)
     probes = encode_items(encoder, probe_items, cfg, device)
+    reference_spread = float(np.linalg.norm(refs.std(axis=0)))
     ref_labels = np.asarray([canonical(y) for _, y in reference_items])
     probe_labels = np.asarray([canonical(y) for _, y in probe_items])
     scores, classes, *_ = score_queries(scorer, probes, refs, ref_labels, device)
@@ -479,6 +500,7 @@ def _validation(encoder, scorer, manifest, cfg, device):
     # Predeclared, equal-weight model selection over two gallery cardinalities.
     return {"meta_val_r1_all": full, "meta_val_r1_24": small,
             "selection_score": (full + small) / 2,
+            "reference_embedding_spread": reference_spread,
             "validation_species": len(set(ref_labels)),
             "group_mode": cfg["group_mode"],
             "small_gallery_species": sorted(subset),
@@ -588,11 +610,13 @@ def train_variant(root, out, manifest, cfg, seed, device):
                   f"{len(sampler.eligible)}", flush=True)
         loader = DataLoader(dataset, batch_sampler=sampler, num_workers=cfg["workers"],
                             pin_memory=device.type == "cuda", persistent_workers=cfg["workers"] > 0)
-        losses, top_m_episodes, max_gallery, skipped_steps = [], 0, 0, 0
+        losses, train_r1, top_m_episodes, max_gallery, skipped_steps = [], [], 0, 0, 0
         for images, batch_labels in loader:
             loss, details = _episode_step(images, batch_labels, cfg, encoder, scorer,
                                           optimizer, scaler, device, classifier, memory)
             losses.append(loss)
+            if "train_episode_r1" in details:
+                train_r1.append(details["train_episode_r1"])
             top_m_episodes += int(details.get("top_m_active", False))
             max_gallery = max(max_gallery, details.get("gallery_images", 0))
             skipped_steps += int(details["optimizer_step_skipped"])
@@ -614,9 +638,12 @@ def train_variant(root, out, manifest, cfg, seed, device):
         if not np.isfinite(metric):
             raise RuntimeError("Non-finite meta-validation score; checkpoint was not advanced")
         print(f"[gallery] {cfg['variant']} seed={seed} epoch={epoch}/{cfg['epochs']} "
-              f"loss={np.mean(losses):.4f} val24={validation['meta_val_r1_24']:.4f} "
+              f"loss={np.mean(losses):.4f} "
+              f"train_episode_r1={np.mean(train_r1) if train_r1 else float('nan'):.4f} "
+              f"val24={validation['meta_val_r1_24']:.4f} "
               f"val{validation['validation_species']}="
               f"{validation['meta_val_r1_all']:.4f} "
+              f"ref_spread={validation['reference_embedding_spread']:.4f} "
               f"topM={top_m_episodes}/{len(losses)} max_gallery={max_gallery} "
               f"amp_skips={skipped_steps}/{len(losses)} "
               f"train_s={train_seconds:.1f} epoch_s={epoch_seconds:.1f} "
@@ -639,6 +666,8 @@ def train_variant(root, out, manifest, cfg, seed, device):
         _save_checkpoint(latest, payload)
         _json(run_dir / "progress.json", {"signature": signature, "epoch": epoch,
                                             "best_score": best_score, "last_validation": validation,
+                                            "train_episode_r1": (float(np.mean(train_r1))
+                                                                 if train_r1 else None),
                                             "top_m_episodes": top_m_episodes,
                                             "max_training_gallery_images": max_gallery,
                                             "amp_skipped_steps": skipped_steps,
@@ -719,6 +748,8 @@ def _embedding_cache(encoder, items, cfg, device, target, checkpoint_hash):
         for batch_index, (images, _) in enumerate(loader, start=1):
             with _autocast(device):
                 embeddings = encoder(images.to(device, non_blocking=True))
+            if not torch.isfinite(embeddings).all():
+                raise RuntimeError(f"Non-finite embeddings while extracting {target} at row {offset}")
             n = len(images)
             matrix[offset:offset + n] = embeddings.float().cpu().numpy()
             offset += n

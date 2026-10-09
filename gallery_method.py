@@ -21,7 +21,9 @@ class GalleryEncoder(nn.Module):
         )
 
     def project(self, features):
-        return F.normalize(self.projection(features.float()), dim=-1)
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            projected = self.projection(features.float())
+            return F.normalize(projected, dim=-1, eps=1e-6)
 
     def forward(self, images):
         return self.project(self.backbone(images))
@@ -174,6 +176,8 @@ def episode_objective(embeddings, scorer, n_way, n_support, n_query,
     large_scores, _ = scorer(query, large_gallery, large_labels)
     loss = F.cross_entropy(large_scores, query_labels)
     diagnostics = {"large_ce": float(loss.detach()),
+                   "train_episode_r1": float((large_scores.argmax(dim=1) == query_labels)
+                                             .float().mean().detach()),
                    "gallery_images": len(large_gallery),
                    "gallery_species": int(large_labels.unique().numel()),
                    "top_m_active": scorer.mode in {"learned", "fixed"} and

@@ -10,6 +10,16 @@ except ImportError:
 
 @unittest.skipUnless(torch is not None, "PyTorch unavailable")
 class WoodGalleryTest(unittest.TestCase):
+    def test_projection_stays_finite_inside_mixed_precision(self):
+        from swid_retrieval.gallery_method import GalleryEncoder
+        encoder = GalleryEncoder(torch.nn.Identity(), feature_dim=2, embedding_dim=2)
+        torch.nn.init.zeros_(encoder.projection[1].weight)
+        torch.nn.init.zeros_(encoder.projection[1].bias)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            embedding = encoder.project(torch.zeros(2, 2))
+        self.assertEqual(embedding.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(embedding).all())
+
     def test_nearest_scorer_matches_exact_image_retrieval(self):
         from swid_retrieval.gallery_method import GalleryScorer
         references = torch.nn.functional.normalize(torch.tensor([
@@ -45,6 +55,8 @@ class WoodGalleryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(loss, expected))
         self.assertFalse(parts["top_m_active"])
         self.assertNotIn("old_ce", parts)
+        self.assertGreaterEqual(parts["train_episode_r1"], 0.0)
+        self.assertLessEqual(parts["train_episode_r1"], 1.0)
         loss.backward()
         self.assertGreater(float(vectors.grad.abs().sum()), 0)
 

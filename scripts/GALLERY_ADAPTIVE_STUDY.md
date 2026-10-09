@@ -22,6 +22,12 @@ margins to the same nearest-image scorer. `gallery_adaptive` retains the
 learned evidence gate only as an ablation. The historical SC-URD pipeline and
 the existing manuscript are not modified by this study.
 
+For numerical stability, the backbone may use CUDA AMP, but embedding
+projection/normalization, gallery scores and the loss run in float32. The
+runner rejects non-finite validation embeddings/scores and records episode
+training R@1 plus AMP skipped steps. A decreasing meta-validation R@1 near
+chance is a failed training hypothesis, even if no exception is raised.
+
 ## Protocol
 
 - Train on SmartWoodID `meta-train` only. Recover original scan IDs from
@@ -93,6 +99,39 @@ the existing manuscript are not modified by this study.
   so that split is also unverified at the specimen level. The evaluation
   JSON marks this limitation. Pooled OOD uses nearest-image distance, not
   class scoring; do not attribute its AUROC gain to the learned gate.
+
+## Diagnostic after unstable scratch training
+
+Do not resume a run that produced non-finite loss or near-chance validation
+after many epochs. Checkpoint signatures include code and training config, so
+a stability fix requires a fresh output directory. After reusing the warmed
+`/content/cache_images`, train one seed for five epochs with and without the
+detached prototype memory, keeping all other settings fixed:
+
+```python
+os.environ.update({
+    "GALLERY_STUDY_MODE": "train",
+    "GALLERY_STUDY_OUT": "/content/drive/MyDrive/NCS/results/metric_retrieval_fp32_diagnostic",
+    "GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
+    "GALLERY_STUDY_VARIANTS": "metric_retrieval,metric_no_memory",
+    "GALLERY_STUDY_SEEDS": "42",
+    "GALLERY_STUDY_EPOCHS": "5",
+    "GALLERY_STUDY_EPISODES_PER_EPOCH": "500",
+    "GALLERY_STUDY_MICROBATCH": "48",
+    "GALLERY_STUDY_BACKBONE_LR": "5e-4",
+    "GALLERY_STUDY_PRELOAD": "0",
+})
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+```
+
+Inspect `train_episode_r1`, `val24`, `val57`, `ref_spread`, `amp_skips` and
+whether both variants remain finite. `ref_spread` is the Euclidean norm of
+the per-coordinate standard deviation of the meta-validation reference
+embeddings; values near zero indicate collapse. Training R@1 and loss are
+not directly comparable between memory/no-memory recipes because they have
+different numbers of competitor classes. If validation stays near chance for
+both, stop and revisit the scratch-encoder training recipe rather than adding
+epochs or choosing a checkpoint on public test results.
 
 ## Colab setup
 

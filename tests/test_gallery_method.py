@@ -59,6 +59,17 @@ class GalleryMethodTest(unittest.TestCase):
             np.asarray(["a", "b", "c"]), torch.device("cpu"))
         self.assertEqual(result["species_r1"], result["nearest_image_r1"])
         self.assertEqual(len(scorer.state_dict()), 0)
+        no_memory = self.experiment.variant_config("metric_no_memory", pilot=True)
+        self.assertEqual(no_memory["scorer_mode"], "nearest")
+        self.assertEqual(no_memory["memory_size"], 0)
+
+    def test_nonfinite_gallery_score_is_rejected(self):
+        scorer = self.method.GalleryScorer(mode="nearest")
+        with self.assertRaisesRegex(RuntimeError, "Non-finite gallery"):
+            self.experiment.score_queries(
+                scorer, self.np.asarray([[float("nan"), 0.]], dtype=self.np.float32),
+                self.np.asarray([[1., 0.]], dtype=self.np.float32),
+                self.np.asarray(["a"]), self.torch.device("cpu"))
 
     def test_variable_gallery_loss_reaches_encoder_features(self):
         torch = self.torch
