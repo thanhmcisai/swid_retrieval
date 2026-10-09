@@ -21,7 +21,8 @@ from torch.nn import functional as F
 from torch.utils.data import BatchSampler, DataLoader, WeightedRandomSampler
 
 from . import data
-from .gallery_method import (ArcFaceClassifier, GalleryEncoder, GalleryMemory, GalleryScorer,
+from .gallery_method import (ArcFaceClassifier, DensePatchBackbone, GalleryEncoder,
+                             GalleryMemory, GalleryScorer,
                              episode_objective, local_species_scores,
                              supervised_contrastive_loss)
 from .wood_encoder import WoodPatternNet
@@ -86,6 +87,32 @@ VARIANTS = {
                         "memory_size": 0, "memory_min_classes": 0,
                         "variable_gallery": False, "stability_weight": 0.0,
                         "pseudo_ood_weight": 0.0},
+    "prototype_large_frozen": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                               "memory_size": 0, "memory_min_classes": 0,
+                               "variable_gallery": False, "stability_weight": 0.0,
+                               "pseudo_ood_weight": 0.0, "train_backbone": False},
+    "prototype_large_scale": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                              "memory_size": 0, "memory_min_classes": 0,
+                              "variable_gallery": False, "stability_weight": 0.0,
+                              "pseudo_ood_weight": 0.0, "cross_scale": True,
+                              "positive_weight": 0.1},
+    "patch_evidence": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                       "memory_size": 0, "memory_min_classes": 0,
+                       "variable_gallery": False, "stability_weight": 0.0,
+                       "pseudo_ood_weight": 0.0, "local_weight": 0.25,
+                       "local_candidates": 64, "local_refs_per_species": 2},
+    "patch_evidence_frozen": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                              "memory_size": 0, "memory_min_classes": 0,
+                              "variable_gallery": False, "stability_weight": 0.0,
+                              "pseudo_ood_weight": 0.0, "local_weight": 0.25,
+                              "local_candidates": 64, "local_refs_per_species": 2,
+                              "train_backbone": False},
+    "patch_evidence_scale": {"scorer_mode": "prototype", "ways": (16, 32, 64),
+                             "memory_size": 0, "memory_min_classes": 0,
+                             "variable_gallery": False, "stability_weight": 0.0,
+                             "pseudo_ood_weight": 0.0, "local_weight": 0.25,
+                             "local_candidates": 64, "local_refs_per_species": 2,
+                             "cross_scale": True, "positive_weight": 0.1},
     "supcon_large": {"objective": "supcon", "scorer_mode": "prototype",
                      "ways": (16, 32, 64), "memory_size": 0, "memory_min_classes": 0,
                      "variable_gallery": False},
@@ -281,10 +308,16 @@ def variant_config(name, *, pilot=False):
                                                              "dinov3_vits16"} else 768)
     if name == "dinov2_pretrained" and config["backbone"] != "dinov2_vitb14":
         raise ValueError("The pretrained 768-dimensional control requires dinov2_vitb14")
-    if config["local_weight"] and not config["backbone"].startswith("woodpattern_"):
-        raise ValueError("Local evidence currently requires WoodPatternNet")
+    if name.startswith("patch_evidence") and not config["backbone"].startswith("dinov2_"):
+        raise ValueError("Patch evidence requires a DINOv2 ViT backbone")
+    if config["local_weight"] and not config["backbone"].startswith(("woodpattern_", "dinov2_")):
+        raise ValueError("Local evidence requires WoodPatternNet or DINOv2")
     if config["local_weight"] and config["memory_size"]:
         raise ValueError("Local evidence requires current-episode references without stale memory")
+    config["local_feature_dim"] = (384 if config["backbone"] == "dinov2_vits14" else
+                                   768 if config["backbone"] == "dinov2_vitb14" else 128)
+    config["local_token_count"] = (16 if config["backbone"].startswith("dinov2_") else
+                                   4 if config["backbone"] == "woodpattern_single_scale" else 12)
     if (not config["ways"] or min(config["ways"]) < 2 or
             not 0 <= config["local_weight"] <= 1 or
             config["aux_ce_weight"] < 0 or config["positive_weight"] < 0 or
@@ -443,6 +476,8 @@ def _model(cfg, device, pretrained=True):
     if kind.startswith("dinov2_"):
         backbone = torch.hub.load(DINO_REPO_REF, kind, pretrained=pretrained)
         feature_dim = 384 if kind == "dinov2_vits14" else 768
+        if cfg.get("local_weight", 0):
+            backbone = DensePatchBackbone(backbone, grid_size=4)
     elif kind == "dinov3_vits16":
         if _hash_file(cfg["dinov3_weights"]) != cfg["dinov3_weights_sha256"]:
             raise ValueError("DINOv3 weights changed after recipe selection")
@@ -459,7 +494,8 @@ def _model(cfg, device, pretrained=True):
         feature_dim = backbone.num_features
     encoder = GalleryEncoder(backbone, feature_dim=feature_dim,
                              embedding_dim=cfg["embedding_dim"],
-                             local_dim=cfg.get("local_dim", 64) if cfg.get("local_weight") else 0).to(device)
+                             local_dim=cfg.get("local_dim", 64) if cfg.get("local_weight") else 0,
+                             local_feature_dim=cfg.get("local_feature_dim", 128)).to(device)
     if cfg["objective"] == "pretrained":
         encoder.projection = torch.nn.Identity()
     scorer = GalleryScorer(cfg["top_m"], cfg["temperature"], cfg["scorer_mode"],
@@ -733,28 +769,44 @@ def _validation_once(encoder, scorer, manifest, cfg, device, fold):
     reference_spread = float(np.linalg.norm(refs.std(axis=0)))
     ref_labels = np.asarray([canonical(y) for _, y in reference_items])
     probe_labels = np.asarray([canonical(y) for _, y in probe_items])
+    global_scores, classes, *_ = score_queries(scorer, probes, refs, ref_labels, device)
     if cfg.get("local_weight", 0):
-        scores, classes = score_queries_evidence(
+        scores, local_classes = score_queries_evidence(
             scorer, probes, refs, ref_labels, probe_tokens, ref_tokens, cfg, device)
+        if not np.array_equal(classes, local_classes):
+            raise RuntimeError("Global/local validation class order differs")
     else:
-        scores, classes, *_ = score_queries(scorer, probes, refs, ref_labels, device)
-    full = float(np.mean([np.mean(classes[scores.argmax(1)][probe_labels == c] == c)
-                          for c in sorted(set(probe_labels))]))
+        scores = global_scores
+    full_by_species = {str(c): float(np.mean(classes[scores.argmax(1)][probe_labels == c] == c))
+                       for c in sorted(set(probe_labels))}
+    full = float(np.mean(list(full_by_species.values())))
     subset = set(sorted(set(ref_labels), key=lambda label: _hash_bytes(label.encode()))[:24])
     mask_r = np.asarray([c in subset for c in ref_labels])
     mask_q = np.asarray([c in subset for c in probe_labels])
+    global_small_scores, small_classes, *_ = score_queries(
+        scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r], device)
     if cfg.get("local_weight", 0):
-        small_scores, small_classes = score_queries_evidence(
+        small_scores, local_small_classes = score_queries_evidence(
             scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r],
             probe_tokens[mask_q], ref_tokens[mask_r], cfg, device)
+        if not np.array_equal(small_classes, local_small_classes):
+            raise RuntimeError("Global/local small-gallery class order differs")
     else:
-        small_scores, small_classes, *_ = score_queries(
-            scorer, probes[mask_q], refs[mask_r], ref_labels[mask_r], device)
+        small_scores = global_small_scores
     small_labels = probe_labels[mask_q]
-    small = float(np.mean([np.mean(small_classes[small_scores.argmax(1)][small_labels == c] == c)
-                           for c in sorted(subset)]))
+    small_by_species = {str(c): float(np.mean(small_classes[small_scores.argmax(1)][small_labels == c] == c))
+                        for c in sorted(subset)}
+    small = float(np.mean(list(small_by_species.values())))
     result = {"meta_val_r1_all": full, "meta_val_r1_24": small,
+            "meta_val_global_r1_all": float(np.mean([
+                np.mean(classes[global_scores.argmax(1)][probe_labels == c] == c)
+                for c in sorted(set(probe_labels))])),
+            "meta_val_global_r1_24": float(np.mean([
+                np.mean(small_classes[global_small_scores.argmax(1)][small_labels == c] == c)
+                for c in sorted(subset)])),
             "selection_score": (full + small) / 2,
+            "meta_val_species_r1_all": full_by_species,
+            "meta_val_species_r1_24": small_by_species,
             "reference_embedding_spread": reference_spread,
             "validation_species": len(set(ref_labels)),
             "group_mode": cfg["group_mode"],
@@ -782,17 +834,40 @@ def _validation_once(encoder, scorer, manifest, cfg, device, fold):
             extra_emb = encode_items(encoder, extra, cfg, device)
         stress_emb = np.concatenate((refs[balanced_indices], extra_emb))
         stress_labels = np.r_[ref_labels[balanced_indices], [label for _, label in extra]]
-        if cfg.get("local_weight", 0):
-            stress_scores, stress_classes = score_queries_evidence(
-                scorer, probes, stress_emb, stress_labels, probe_tokens, stress_tokens, cfg, device)
-        else:
-            stress_scores, stress_classes, *_ = score_queries(
-                scorer, probes, stress_emb, stress_labels, device)
-        stress = float(np.mean([np.mean(stress_classes[stress_scores.argmax(1)][probe_labels == c] == c)
-                                for c in sorted(set(probe_labels))]))
+        extra_order = sorted(range(len(extra)), key=lambda index: _hash_bytes(extra[index][1].encode()))
+        curve, curve_by_species, global_curve = {}, {}, {}
+        for gallery_size in [size for size in (128, 256) if size < len(stress_emb)] + [len(stress_emb)]:
+            chosen_extra = extra_order[:gallery_size - len(balanced_indices)]
+            chosen = np.r_[np.arange(len(balanced_indices)),
+                           len(balanced_indices) + np.asarray(chosen_extra, dtype=np.int64)]
+            gallery_emb = stress_emb[chosen]
+            gallery_labels = stress_labels[chosen]
+            global_stress_scores, global_stress_classes, *_ = score_queries(
+                scorer, probes, gallery_emb, gallery_labels, device)
+            if cfg.get("local_weight", 0):
+                stress_scores, stress_classes = score_queries_evidence(
+                    scorer, probes, gallery_emb, gallery_labels,
+                    probe_tokens, stress_tokens[chosen], cfg, device)
+                if not np.array_equal(global_stress_classes, stress_classes):
+                    raise RuntimeError("Global/local stress-gallery class order differs")
+            else:
+                stress_scores, stress_classes = global_stress_scores, global_stress_classes
+            per_species = {
+                str(c): float(np.mean(stress_classes[stress_scores.argmax(1)][probe_labels == c] == c))
+                for c in sorted(set(probe_labels))}
+            curve_by_species[str(gallery_size)] = per_species
+            curve[str(gallery_size)] = float(np.mean(list(per_species.values())))
+            global_curve[str(gallery_size)] = float(np.mean([
+                np.mean(global_stress_classes[global_stress_scores.argmax(1)][probe_labels == c] == c)
+                for c in sorted(set(probe_labels))]))
+        stress = curve[str(len(stress_emb))]
         result.update(meta_val_r1_stress=stress, stress_gallery_species=len(set(stress_labels)),
+                      meta_val_global_r1_stress=global_curve[str(len(stress_emb))],
                       stress_gallery_images=len(stress_emb),
                       stress_references_per_species=1,
+                      meta_val_gallery_curve=curve,
+                      meta_val_global_gallery_curve=global_curve,
+                      meta_val_gallery_curve_by_species=curve_by_species,
                       selection_score=(small + stress) / 2)
     return result
 
@@ -803,11 +878,29 @@ def _validation(encoder, scorer, manifest, cfg, device):
     if len(folds) == 1:
         return folds[0]
     summary = dict(folds[0])
-    for name in ("meta_val_r1_all", "meta_val_r1_24", "selection_score",
+    for name in ("meta_val_r1_all", "meta_val_r1_24", "meta_val_global_r1_all",
+                 "meta_val_global_r1_24", "selection_score",
                  "reference_embedding_spread"):
         summary[name] = float(np.mean([fold[name] for fold in folds]))
     if "meta_val_r1_stress" in folds[0]:
         summary["meta_val_r1_stress"] = float(np.mean([fold["meta_val_r1_stress"] for fold in folds]))
+        summary["meta_val_global_r1_stress"] = float(np.mean([
+            fold["meta_val_global_r1_stress"] for fold in folds]))
+        summary["meta_val_gallery_curve"] = {
+            size: float(np.mean([fold["meta_val_gallery_curve"][size] for fold in folds]))
+            for size in folds[0]["meta_val_gallery_curve"]}
+        summary["meta_val_global_gallery_curve"] = {
+            size: float(np.mean([fold["meta_val_global_gallery_curve"][size] for fold in folds]))
+            for size in folds[0]["meta_val_global_gallery_curve"]}
+        summary["meta_val_gallery_curve_by_species"] = {
+            size: {species: float(np.mean([
+                fold["meta_val_gallery_curve_by_species"][size][species] for fold in folds]))
+                   for species in folds[0]["meta_val_gallery_curve_by_species"][size]}
+            for size in folds[0]["meta_val_gallery_curve_by_species"]}
+    for name in ("meta_val_species_r1_all", "meta_val_species_r1_24"):
+        summary[name] = {
+            species: float(np.mean([fold[name][species] for fold in folds]))
+            for species in folds[0][name]}
     summary["fold_metrics"] = folds
     summary["validation_folds"] = len(folds)
     return summary
@@ -1214,6 +1307,8 @@ def _embedding_cache(encoder, items, cfg, device, target, checkpoint_hash):
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     use_local = bool(cfg.get("local_weight", 0))
+    local_count = cfg.get("local_token_count", 4 if cfg["backbone"] == "woodpattern_single_scale"
+                          else 16 if cfg["backbone"].startswith("dinov2_") else 12)
     local_path = target.with_name(target.stem + "_tokens.npy")
     signature = _hash_bytes(json.dumps({"checkpoint": checkpoint_hash,
                                          "image_size": cfg["image_size"],
@@ -1236,16 +1331,13 @@ def _embedding_cache(encoder, items, cfg, device, target, checkpoint_hash):
             target, mode="w+", dtype=np.float32, shape=(len(items), cfg["embedding_dim"]))
         local_matrix = (np.lib.format.open_memmap(
             local_path, mode="w+", dtype=np.float16,
-            shape=(len(items), 4 * (1 if cfg["backbone"] == "woodpattern_single_scale" else 3),
-                   cfg["local_dim"])) if use_local else None)
+            shape=(len(items), local_count, cfg["local_dim"])) if use_local else None)
         offset = 0
         _json(progress_path, {"signature": signature, "offset": 0,
                               "checkpoint_sha256": checkpoint_hash, "rows": len(items)})
     if matrix.shape != (len(items), cfg["embedding_dim"]) or not 0 <= offset <= len(items):
         raise ValueError(f"Invalid embedding cache dimensions or cursor for {target}")
-    if use_local and local_matrix.shape != (
-            len(items), 4 * (1 if cfg["backbone"] == "woodpattern_single_scale" else 3),
-            cfg["local_dim"]):
+    if use_local and local_matrix.shape != (len(items), local_count, cfg["local_dim"]):
         raise ValueError(f"Invalid local-token cache dimensions for {local_path}")
     if offset == len(items):
         if use_local and not np.isfinite(local_matrix).all():
@@ -1756,7 +1848,12 @@ def run():
                              "wood_encoder_sha256": _hash_file(Path(__file__).with_name("wood_encoder.py")),
                              "val24_r1": val["meta_val_r1_24"],
                              "val_all_r1": val["meta_val_r1_all"],
+                             "val24_global_r1": val["meta_val_global_r1_24"],
+                             "val_all_global_r1": val["meta_val_global_r1_all"],
+                             "val128_r1": val.get("meta_val_gallery_curve", {}).get("128"),
+                             "val256_r1": val.get("meta_val_gallery_curve", {}).get("256"),
                              "val_stress_r1": val.get("meta_val_r1_stress"),
+                             "val_stress_global_r1": val.get("meta_val_global_r1_stress"),
                              "stress_gallery_species": val.get("stress_gallery_species"),
                              "selection_score": val["selection_score"],
                              "reference_spread": val["reference_embedding_spread"],
@@ -1775,7 +1872,9 @@ def run():
             table = table.drop_duplicates(["backbone", "variant", "seed", "image_size"], keep="last")
         table.sort_values(["backbone", "variant", "seed", "image_size"]).to_csv(
             screen_path, index=False)
-        metrics = ["val24_r1", "val_all_r1", "val_stress_r1", "selection_score",
+        metrics = ["val24_r1", "val_all_r1", "val24_global_r1", "val_all_global_r1",
+                   "val128_r1", "val256_r1", "val_stress_r1", "val_stress_global_r1",
+                   "selection_score",
                    "reference_spread"]
         aggregate = table.groupby(["backbone", "variant"])[metrics].agg(["mean", "std", "count"])
         aggregate.columns = [f"{metric}_{stat}" for metric, stat in aggregate.columns]

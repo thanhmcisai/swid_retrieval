@@ -5,21 +5,50 @@ kept outside this module so the same model works for frozen and full fine-tuning
 """
 
 from collections import OrderedDict
+import math
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
+class DensePatchBackbone(nn.Module):
+    """Expose pooled DINOv2 patch tokens without changing its CLS embedding."""
+
+    def __init__(self, model, grid_size=4):
+        super().__init__()
+        self.model = model
+        self.grid_size = int(grid_size)
+        self.num_features = model.num_features
+        if self.grid_size < 1:
+            raise ValueError("Patch evidence grid must be positive")
+
+    def forward(self, images):
+        return self.model(images)
+
+    def forward_with_tokens(self, images):
+        output = self.model.forward_features(images)
+        patches = output["x_norm_patchtokens"]
+        side = math.isqrt(patches.shape[1])
+        if side * side != patches.shape[1]:
+            raise ValueError("DINOv2 patch tokens do not form a square grid")
+        patch_map = patches.transpose(1, 2).reshape(len(images), patches.shape[-1], side, side)
+        local = F.adaptive_avg_pool2d(patch_map, (self.grid_size, self.grid_size))
+        local = local.flatten(2).transpose(1, 2)
+        return output["x_norm_clstoken"], local
+
+
 class GalleryEncoder(nn.Module):
-    def __init__(self, backbone, feature_dim=768, embedding_dim=512, local_dim=0):
+    def __init__(self, backbone, feature_dim=768, embedding_dim=512, local_dim=0,
+                 local_feature_dim=128):
         super().__init__()
         self.backbone = backbone
         self.projection = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, embedding_dim),
         )
-        self.local_projection = (nn.Sequential(nn.LayerNorm(128), nn.Linear(128, local_dim))
+        self.local_projection = (nn.Sequential(nn.LayerNorm(local_feature_dim),
+                                               nn.Linear(local_feature_dim, local_dim))
                                  if local_dim else None)
 
     def project(self, features):

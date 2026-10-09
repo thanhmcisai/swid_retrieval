@@ -198,6 +198,127 @@ class GalleryMethodTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "licensed local"):
                 self.experiment.variant_config("pretrained_control")
 
+    def test_dinov2_patch_recipes_isolate_backbone_and_score_ablations(self):
+        with patch.dict(os.environ, {"GALLERY_STUDY_BACKBONE": "dinov2_vits14",
+                                  "GALLERY_STUDY_INIT_CHECKPOINT": ""}):
+            full = self.experiment.variant_config("prototype_large")
+            frozen = self.experiment.variant_config("prototype_large_frozen")
+            patch_model = self.experiment.variant_config("patch_evidence")
+            patch_frozen = self.experiment.variant_config("patch_evidence_frozen")
+            scale = self.experiment.variant_config("patch_evidence_scale")
+        self.assertEqual(full["ways"], frozen["ways"])
+        self.assertTrue(full["train_backbone"])
+        self.assertFalse(frozen["train_backbone"])
+        self.assertTrue(patch_model["train_backbone"])
+        self.assertFalse(patch_frozen["train_backbone"])
+        self.assertEqual(patch_model["local_feature_dim"], 384)
+        self.assertEqual(patch_model["local_token_count"], 16)
+        self.assertEqual(patch_model["scorer_mode"], "prototype")
+        self.assertTrue(scale["cross_scale"])
+        with patch.dict(os.environ, {"GALLERY_STUDY_BACKBONE": "woodpattern_tiny",
+                                  "GALLERY_STUDY_INIT_CHECKPOINT": ""}):
+            with self.assertRaisesRegex(ValueError, "requires a DINOv2"):
+                self.experiment.variant_config("patch_evidence")
+
+    def test_dense_patch_backbone_keeps_cls_and_trains_local_projection(self):
+        torch = self.torch
+
+        class TinyDino(torch.nn.Module):
+            num_features = 8
+
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 8, 1)
+
+            def forward_features(self, x):
+                patches = torch.nn.functional.adaptive_avg_pool2d(self.conv(x), (4, 4))
+                patches = patches.flatten(2).transpose(1, 2)
+                return {"x_norm_clstoken": patches.mean(1),
+                        "x_norm_patchtokens": patches}
+
+            def forward(self, x):
+                return self.forward_features(x)["x_norm_clstoken"]
+
+        base = TinyDino()
+        dense = self.method.DensePatchBackbone(base)
+        encoder = self.method.GalleryEncoder(dense, 8, 4, local_dim=4,
+                                             local_feature_dim=8)
+        x = torch.randn(2, 3, 8, 8)
+        cls, patches = dense.forward_with_tokens(x)
+        self.assertTrue(torch.allclose(cls, base(x)))
+        self.assertEqual(patches.shape, (2, 16, 8))
+        global_embedding, local_embedding = encoder.forward_with_tokens(x)
+        self.assertEqual(global_embedding.shape, (2, 4))
+        self.assertEqual(local_embedding.shape, (2, 16, 4))
+        (global_embedding.square().mean() + local_embedding[:, 0].sum()).backward()
+        self.assertIsNotNone(base.conv.weight.grad)
+        self.assertIsNotNone(encoder.local_projection[1].weight.grad)
+
+    def test_patch_episode_freeze_and_gradient_replay(self):
+        torch = self.torch
+
+        class TinyDino(torch.nn.Module):
+            num_features = 8
+
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 8, 1)
+
+            def forward_features(self, images):
+                patches = torch.nn.functional.adaptive_avg_pool2d(self.conv(images), (4, 4))
+                patches = patches.flatten(2).transpose(1, 2)
+                return {"x_norm_clstoken": patches.mean(1),
+                        "x_norm_patchtokens": patches}
+
+            def forward(self, images):
+                return self.forward_features(images)["x_norm_clstoken"]
+
+        class CPUScaler:
+            def scale(self, loss):
+                return loss
+
+            def unscale_(self, optimizer):
+                pass
+
+            def step(self, optimizer):
+                optimizer.step()
+
+            def update(self):
+                pass
+
+            def get_scale(self):
+                return 1.0
+
+            def is_enabled(self):
+                return False
+
+        images = torch.randn(6, 3, 8, 8)
+        labels = torch.tensor([0, 0, 1, 1, 0, 1])
+        cfg = {"support": 2, "queries": 1, "microbatch": 3,
+               "objective": "episode", "variable_gallery": False,
+               "local_weight": 0.25, "temperature": 0.07,
+               "positive_weight": 0, "aux_ce_weight": 0}
+        for train_backbone in (False, True):
+            base = TinyDino()
+            encoder = self.method.GalleryEncoder(
+                self.method.DensePatchBackbone(base), 8, 4, local_dim=4,
+                local_feature_dim=8)
+            encoder.backbone.requires_grad_(train_backbone)
+            scorer = self.method.GalleryScorer(mode="prototype")
+            optimizer = torch.optim.SGD(
+                (parameter for parameter in encoder.parameters() if parameter.requires_grad),
+                lr=0.1)
+            before_backbone = base.conv.weight.detach().clone()
+            before_local = encoder.local_projection[1].weight.detach().clone()
+            loss, details = self.experiment._episode_step(
+                images, labels, {**cfg, "train_backbone": train_backbone},
+                encoder, scorer, optimizer, CPUScaler(), torch.device("cpu"))
+            self.assertTrue(self.np.isfinite(loss))
+            self.assertEqual(details["gallery_images"], 4)
+            self.assertEqual(torch.equal(before_backbone, base.conv.weight),
+                             not train_backbone)
+            self.assertFalse(torch.equal(before_local, encoder.local_projection[1].weight))
+
     def test_local_shortlist_reranks_and_backpropagates(self):
         torch, np = self.torch, self.np
         scorer = self.method.GalleryScorer(mode="nearest")
@@ -284,6 +405,9 @@ class GalleryMethodTest(unittest.TestCase):
         self.assertEqual(result["stress_gallery_images"], 28)
         self.assertEqual(result["validation_folds"], 2)
         self.assertEqual(result["meta_val_r1_stress"], 1.0)
+        self.assertEqual(result["meta_val_gallery_curve"]["28"], 1.0)
+        self.assertEqual(result["meta_val_global_r1_24"], result["meta_val_r1_24"])
+        self.assertEqual(result["meta_val_global_r1_stress"], result["meta_val_r1_stress"])
         self.assertEqual(result["selection_score"], 1.0)
         cfg.update({"local_weight": 0.35, "local_candidates": 8,
                     "local_refs_per_species": 2, "temperature": 0.07})
@@ -297,7 +421,37 @@ class GalleryMethodTest(unittest.TestCase):
                 None, self.method.GalleryScorer(mode="nearest"), manifest, cfg,
                 torch.device("cpu"), fold=0)
         self.assertEqual(local["stress_gallery_species"], 28)
+        self.assertEqual(local["meta_val_global_r1_stress"], 1.0)
         self.assertEqual(local["selection_score"], 1.0)
+
+    def test_meta_val_gallery_curve_uses_fixed_target_classes(self):
+        np, torch = self.np, self.torch
+        manifest = {"meta-train": [(f"train_{i}.jpg", f"train_{i}") for i in range(260)],
+                    "meta-val": [(f"patch_256_{j}_from_Tw{1000 + 2 * i + scan}.jpg",
+                                  f"val_{i}") for i in range(24) for scan in range(2)
+                                 for j in range(5)]}
+        labels = sorted({label for rows in manifest.values() for _, label in rows})
+        lookup = {label: i for i, label in enumerate(labels)}
+
+        def fake_encode(_encoder, items, _cfg, _device):
+            matrix = np.zeros((len(items), len(labels)), dtype=np.float32)
+            for row, (_, label) in enumerate(items):
+                matrix[row, lookup[label]] = 1
+            return matrix
+
+        cfg = {"group_mode": "scan_disjoint", "validation_folds": 2,
+               "validation_train_distractors": 1, "local_weight": 0}
+        with patch.object(self.experiment, "encode_items", side_effect=fake_encode):
+            result = self.experiment._validation(
+                None, self.method.GalleryScorer(mode="prototype"), manifest,
+                cfg, torch.device("cpu"))
+        self.assertEqual(set(result["meta_val_gallery_curve"]), {"128", "256", "284"})
+        self.assertTrue(all(score == 1 for score in result["meta_val_gallery_curve"].values()))
+        self.assertEqual(result["meta_val_global_gallery_curve"], result["meta_val_gallery_curve"])
+        self.assertEqual(len(result["meta_val_species_r1_all"]), 24)
+        self.assertEqual(len(result["meta_val_gallery_curve_by_species"]["284"]), 24)
+        self.assertEqual(result["meta_val_gallery_curve_by_species"]["284"]["val_0"], 1)
+        self.assertEqual(result["stress_gallery_species"], 284)
 
     def test_local_embedding_cache_resumes_with_aligned_tokens(self):
         torch, np = self.torch, self.np
@@ -324,6 +478,26 @@ class GalleryMethodTest(unittest.TestCase):
             self.assertTrue(np.array_equal(first, second))
             self.assertEqual(tokens.shape, (2, 4, 8))
             self.assertEqual(tokens.dtype, np.float16)
+
+    def test_dinov2_patch_cache_uses_sixteen_tokens(self):
+        torch, np = self.torch, self.np
+
+        class TinyEncoder(torch.nn.Module):
+            def forward_with_tokens(self, images):
+                return torch.nn.functional.normalize(images[:, :2], dim=1), images[:, None, :8].repeat(1, 16, 1)
+
+        def fake_loader(items, _cfg):
+            yield torch.ones(len(items), 8), None
+
+        cfg = {"image_size": 224, "embedding_dim": 2, "backbone": "dinov2_vits14",
+               "local_dim": 8, "local_weight": 0.25, "local_token_count": 16}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "embeddings.npy"
+            with patch.object(self.experiment, "_loader", side_effect=fake_loader):
+                self.experiment._embedding_cache(TinyEncoder(), [("a.jpg", "a")], cfg,
+                                                 torch.device("cpu"), target, "hash")
+            tokens = np.load(target.with_name("embeddings_tokens.npy"))
+            self.assertEqual(tokens.shape, (1, 16, 8))
 
     def test_local_encoder_accepts_only_local_head_missing_from_warmup(self):
         torch = self.torch
