@@ -4,8 +4,10 @@ import importlib.util
 import io
 import os
 import runpy
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 
@@ -123,6 +125,27 @@ class WoodEvidenceMethodTest(unittest.TestCase):
                          ("torch", "numpy", "pandas", "cv2", "albumentations")),
                      "Gallery dependencies unavailable")
 class WoodEvidenceExperimentTest(unittest.TestCase):
+    def test_legacy_feature_cache_is_reused_after_reader_fix(self):
+        import numpy as np
+        import torch
+        from swid_retrieval import wood_evidence_experiment as experiment
+        items = [("/scale_256/patch_a_from_Tw001.jpg", "species_a")]
+        base_hash = "checkpoint-hash"
+        signature = experiment._cache_signature(
+            items, base_hash, experiment._LEGACY_EXPERIMENT_SHA256)
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "feature_cache"
+            cache.mkdir()
+            path = cache / f"meta_val_fold0_refs_{signature[:16]}.npz"
+            np.savez(path, signature=np.asarray(signature),
+                     global_emb=np.ones((1, 512), dtype=np.float32),
+                     tokens=np.ones((1, 16, 512), dtype=np.float16))
+            global_emb, tokens = experiment._feature_cache(
+                Path(folder), "meta_val_fold0_refs", items, None, {},
+                torch.device("cpu"), base_hash)
+            self.assertEqual(global_emb.shape, (1, 512))
+            self.assertEqual(tokens.shape, (1, 16, 512))
+
     def test_runpy_dispatches_evidence_study_only(self):
         from swid_retrieval import wood_evidence_experiment as experiment
         flags = {name: "0" for name in (

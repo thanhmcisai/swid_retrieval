@@ -6,6 +6,7 @@ Meta-test is accessible only in the explicit final mode after model selection.
 """
 
 import json
+import inspect
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -17,6 +18,9 @@ from torch.nn import functional as F
 
 from . import data, gallery_diagnostics as diagnostics, gallery_experiment as study
 from .wood_evidence_method import WoodEvidenceReranker, prototype_scores
+
+_LEGACY_EXTRACTOR_SOURCE_SHA256 = "7a0a40e475bed1ee9d9bfe4ea58f355afe27775d6762efc07db99d1cee3cf9ff"
+_LEGACY_EXPERIMENT_SHA256 = "479dc0dece69f5c6f7aafee367d99504c95161e93b60e5b739dbb38f3d336f5e"
 
 
 def _atomic_json(path, payload):
@@ -132,13 +136,22 @@ def _extract(encoder, items, cfg, device):
 
 
 def _feature_cache(out, cache_name, items, encoder, cfg, device, base_hash):
-    signature = _cache_signature(items, base_hash, study._hash_file(__file__))
+    extractor_hash = study._hash_bytes(inspect.getsource(_extract).encode())
+    signatures = [_cache_signature(items, base_hash, extractor_hash)]
+    if extractor_hash == _LEGACY_EXTRACTOR_SOURCE_SHA256:
+        signatures.append(_cache_signature(items, base_hash, _LEGACY_EXPERIMENT_SHA256))
+    for candidate in signatures:
+        cached = out / "feature_cache" / f"{cache_name}_{candidate[:16]}.npz"
+        if cached.is_file():
+            with np.load(cached, allow_pickle=False) as saved:
+                if (str(saved["signature"]) != candidate or
+                        len(saved["global_emb"]) != len(items) or
+                        len(saved["tokens"]) != len(items)):
+                    raise ValueError(f"Feature cache identity mismatch: {cached}")
+                print(f"[wood-evidence] reusing {cached.name}", flush=True)
+                return saved["global_emb"], saved["tokens"]
+    signature = signatures[0]
     path = out / "feature_cache" / f"{cache_name}_{signature[:16]}.npz"
-    if path.is_file():
-        with np.load(path, allow_pickle=False) as saved:
-            if str(saved["signature"]) != signature or len(saved["global"]) != len(items):
-                raise ValueError(f"Feature cache identity mismatch: {path}")
-            return saved["global_emb"], saved["tokens"]
     if encoder is None:
         raise ValueError(f"Feature cache absent; encoder is needed: {path}")
     print(f"[wood-evidence] extracting {cache_name}: {len(items)} images", flush=True)
@@ -163,9 +176,12 @@ def _encoder_from_state(state, cfg, device):
 def _features(out, name, items, encoder, cfg, device, base_hash):
     extraction = dict(cfg)
     extraction["image_batch"] = int(os.environ.get("WOOD_EVIDENCE_IMAGE_BATCH", "64"))
-    extraction["workers"] = int(os.environ.get("WOOD_EVIDENCE_WORKERS", "8"))
-    if extraction["image_batch"] < 1 or extraction["workers"] < 0:
+    requested_workers = int(os.environ.get("WOOD_EVIDENCE_WORKERS", "8"))
+    if extraction["image_batch"] < 1 or requested_workers < 0:
         raise ValueError("Invalid image extraction batch or workers")
+    available_cpus = (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                      else os.cpu_count() or 1)
+    extraction["workers"] = min(requested_workers, available_cpus)
     embeddings, tokens = _feature_cache(out, name, items, encoder, extraction,
                                         device, base_hash)
     if embeddings.shape != (len(items), 512) or tokens.shape != (len(items), 16, 512):
