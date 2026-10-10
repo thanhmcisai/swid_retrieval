@@ -138,3 +138,42 @@ first. Review `selection_lock.json`, `selection_candidates.csv`,
 claims. Paired CIs are across public-ID species for fixed checkpoints only;
 they do not quantify full training-run variance. The 954-species public-ID
 macro R@1 is not directly interchangeable with the SWI meta-test 637-way R@1.
+
+## Follow-up diagnosis: why is the true species deep in the ranking?
+
+Do not label this a wood-specific fine-grained effect without controls. In the
+earlier matched global-only seed-43 meta-val report
+(`wood_correspondence_matched_review.zip`), the same 57 unseen target species
+with one reference each went from R@1=0.395 and candidate recall@5=0.681 in
+the 57-species gallery to R@1=0.153 and recall@5=0.353 in the 637-species
+gallery. At 637 species, candidate recall@32=0.640 and @128=0.804: about 20%
+of queries are outside top-128, not all queries. The extra 580 distractors are
+557 meta-train species plus 23 meta-val species excluded from the scan-disjoint
+targets. This creates a potential seen-distractor/unseen-target asymmetry in
+addition to cardinality. K=1, source-scan separation, image-scale differences,
+prototype quality and genuine anatomical similarity are further hypotheses.
+
+After the locked run, inspect the following without tuning on meta-test or
+public-ID:
+
+- Rank quantiles and candidate recall@1/5/10/32/128 by species and source;
+  separate isolated outliers from a general ranking failure.
+- Paired cardinality curve with fixed queries and the same target reference
+  image; this isolates added distractors. Contrast 57x1 against 57x5 separately
+  to measure the reference-count effect.
+- Fraction of high-scoring false matches from meta-train species versus other
+  distractors. The groups are unequal in the current 637-way protocol, so a
+  raw fraction alone is not evidence of known-class bias.
+- Same-genus versus different-genus false matches, source scan, magnification,
+  and image-quality strata; manually inspect a small pre-specified sample of
+  the deepest-rank failures with anatomical expertise.
+- Stage-1 candidate recall and stage-2 conditional accuracy. If candidate
+  recall@128 is below the target R@1, improve the encoder/candidate search;
+  otherwise prioritize reranking and its query-reference loss.
+
+Potential next loss ablation, only after the above diagnosis: add a hard-pair
+margin loss on QKV scores or distill QKV rankings into the global encoder.
+Compare each against the unchanged current recipe (episode cross-entropy,
+global auxiliary loss, SupCon and prototype-bank loss), with matched seeds and
+meta-val-only selection. Do not add a generic contrastive term and attribute
+any gain to novel wood anatomy without a matching control.
