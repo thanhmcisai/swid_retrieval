@@ -21,6 +21,7 @@ inference-only final audit. Full-pipeline flags are ignored in that mode.
 Set RUN_FINAL_SCURD_RETRAIN=1 to run only the isolated three-seed head rerun.
 Set RUN_GALLERY_STUDY=1 to run only the isolated end-to-end gallery study.
 Set RUN_GALLERY_DIAGNOSTICS=1 for inference-only gallery checkpoint diagnosis.
+Set RUN_WOOD_EVIDENCE_STUDY=1 for the isolated local-evidence retrieval study.
 """
 
 import os
@@ -109,7 +110,14 @@ if __name__ == "__main__":
     import torch
     print(f"CUDA: {torch.cuda.is_available()} "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    if os.environ.get("RUN_GALLERY_DIAGNOSTICS", "0") == "1":
+    if os.environ.get("RUN_WOOD_EVIDENCE_STUDY", "0") == "1":
+        if any(os.environ.get(flag, "0") == "1" for flag in (
+                "RUN_GALLERY_DIAGNOSTICS", "RUN_GALLERY_STUDY", "RUN_REPAIR_PUBLIC_ROWS",
+                "RUN_FINAL_SCURD_RETRAIN", "RUN_FINAL_COLAB_AUDIT")):
+            raise ValueError("Run the wood-evidence study separately from other modes")
+        from swid_retrieval import wood_evidence_experiment
+        wood_evidence_experiment.run()
+    elif os.environ.get("RUN_GALLERY_DIAGNOSTICS", "0") == "1":
         if any(os.environ.get(flag, "0") == "1" for flag in (
                 "RUN_GALLERY_STUDY", "RUN_REPAIR_PUBLIC_ROWS",
                 "RUN_FINAL_SCURD_RETRAIN", "RUN_FINAL_COLAB_AUDIT")):
