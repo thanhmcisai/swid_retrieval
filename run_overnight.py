@@ -110,7 +110,16 @@ if __name__ == "__main__":
     import torch
     print(f"CUDA: {torch.cuda.is_available()} "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    if os.environ.get("RUN_WOOD_CORRESPONDENCE_IMAGE_TRAIN", "0") == "1":
+    if os.environ.get("RUN_WOOD_CORRESPONDENCE_COMPARE", "0") == "1":
+        if any(os.environ.get(flag, "0") == "1" for flag in (
+                "RUN_WOOD_CORRESPONDENCE_IMAGE_TRAIN", "RUN_WOOD_CORRESPONDENCE_STUDY",
+                "RUN_WOOD_EVIDENCE_STUDY", "RUN_GALLERY_DIAGNOSTICS",
+                "RUN_GALLERY_STUDY", "RUN_REPAIR_PUBLIC_ROWS",
+                "RUN_FINAL_SCURD_RETRAIN", "RUN_FINAL_COLAB_AUDIT")):
+            raise ValueError("Run correspondence comparison separately from other modes")
+        from swid_retrieval import wood_correspondence_compare
+        wood_correspondence_compare.run()
+    elif os.environ.get("RUN_WOOD_CORRESPONDENCE_IMAGE_TRAIN", "0") == "1":
         if any(os.environ.get(flag, "0") == "1" for flag in (
                 "RUN_WOOD_CORRESPONDENCE_STUDY", "RUN_WOOD_EVIDENCE_STUDY",
                 "RUN_GALLERY_DIAGNOSTICS", "RUN_GALLERY_STUDY",
