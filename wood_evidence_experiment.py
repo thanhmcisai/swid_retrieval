@@ -34,6 +34,8 @@ def _base_checkpoint(root, study_out, seed):
             cfg["scorer_mode"] != "prototype" or cfg.get("local_weight", 0) or
             cfg["group_mode"] != "scan_disjoint" or
             cfg["validation_folds"] != 2 or
+            cfg["validation_train_distractors"] != 1 or
+            "637" not in state["validation"].get("meta_val_gallery_curve", {}) or
             state["signature"] != study._run_signature(root, cfg, seed)):
         raise ValueError("Base checkpoint recipe/code/manifest provenance changed")
     return path, state, cfg
