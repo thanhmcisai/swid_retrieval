@@ -69,6 +69,27 @@ class LargeGalleryProtocolTest(unittest.TestCase):
         targets = torch.tensor([2, 0])
         self.assertAlmostEqual(large._macro_mrr(scores, targets), 0.25)
 
+    def test_bank_loss_backpropagates_from_inference_bank(self):
+        import torch
+        from swid_retrieval import wood_large_gallery as large
+        from swid_retrieval.wood_correspondence_method import WoodCorrespondence
+
+        model = WoodCorrespondence(dimension=8, token_dim=4)
+        query = torch.randn(4, 8, requires_grad=True)
+        references = torch.randn(8, 8, requires_grad=True)
+        labels = torch.arange(4).repeat_interleave(2).tolist()
+        species = [f"species_{i}" for i in range(4)]
+        bank_labels = species + [f"negative_{i}" for i in range(12)]
+        with torch.inference_mode():
+            bank = torch.randn(len(bank_labels), 8)
+        for arm in ("hard_bank", "random_bank"):
+            loss = large._bank_loss(model, query, references, labels, species,
+                                    bank_labels, bank, 8, arm)
+            loss.backward(retain_graph=True)
+            self.assertTrue(torch.isfinite(query.grad).all())
+            self.assertGreater(float(query.grad.norm()), 0)
+            query.grad.zero_()
+
     def test_episode_and_candidate_smoke(self):
         import torch
         from swid_retrieval import wood_large_gallery as large

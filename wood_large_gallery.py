@@ -92,7 +92,7 @@ def _bank(encoder, model, representatives, base_cfg, device):
     labels = sorted({study.canonical(label) for _, label in representatives})
     indices = torch.tensor([labels.index(study.canonical(label))
                             for _, label in representatives], device=device)
-    with torch.inference_mode():
+    with torch.no_grad():
         transformed = corr._transformed(model, torch.as_tensor(embeddings, device=device))
         prototypes, classes, _ = class_prototypes(transformed, indices)
     if len(classes) != len(labels):
@@ -149,6 +149,8 @@ def _episode_plan(items, by_class, valid, bank_labels, bank, arm, cfg, seed, epo
 
 def _bank_loss(model, query, refs, episode_labels, species, bank_labels, bank,
                count, arm):
+    if bank.is_inference():
+        bank = bank.clone()
     q = corr._transformed(model, query)
     r = corr._transformed(model, refs)
     prototypes, classes, _ = class_prototypes(
@@ -769,6 +771,14 @@ def _smoke(device):
                           bank_labels, bank, 32, arm)
         if not torch.isfinite(loss):
             raise RuntimeError("Memory-bank loss smoke test failed")
+    with torch.inference_mode():
+        inference_bank = bank.clone()
+    differentiable_query = query.detach().requires_grad_(True)
+    _bank_loss(model, differentiable_query, refs, labels.tolist(), bank_labels[:4],
+               bank_labels, inference_bank, 32, "hard_bank").backward()
+    if (differentiable_query.grad is None or
+            not torch.isfinite(differentiable_query.grad).all()):
+        raise RuntimeError("Memory-bank gradient smoke test failed")
     items = [(f"/scale_256/patch_{j}_from_Tw{i*4+s:05d}.jpg", label)
              for i, label in enumerate(bank_labels) for s in range(2) for j in range(6)]
     by_class, valid = image_train._layout(items)
