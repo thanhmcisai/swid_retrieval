@@ -59,6 +59,14 @@ def _settings():
     return cfg
 
 
+def _evaluation_io(settings):
+    batch = int(os.environ.get("WOOD_LARGE_EVAL_IMAGE_BATCH", settings["image_batch"]))
+    workers = int(os.environ.get("WOOD_LARGE_EVAL_WORKERS", settings["workers"]))
+    if batch < 1 or workers < 0:
+        raise ValueError("Invalid full-gallery inference batch or worker count")
+    return batch, workers
+
+
 def _upstream_seed(seed):
     source = os.environ.get("WOOD_LARGE_SOURCE_SEED", "43")
     return seed if source == "match" else int(source)
@@ -395,8 +403,12 @@ def _cache_features(encoder, items, cfg, device, path, checkpoint_hash, tokens):
         loader = study._loader(items[offset:], cfg)
         loader.dataset.loader = _RetryImageLoader(loader.dataset.loader)
         encoder.eval()
+        started = time.perf_counter()
+        start_offset = offset
+        pending_globals, pending_locals = [], []
+        pending_count = 0
         with torch.inference_mode():
-            for number, (images, _) in enumerate(loader, 1):
+            for images, _ in loader:
                 with study._autocast(device):
                     if tokens:
                         g, t = corr._encode_images(encoder, images.to(device, non_blocking=True))
@@ -405,16 +417,26 @@ def _cache_features(encoder, items, cfg, device, path, checkpoint_hash, tokens):
                 if not torch.isfinite(g).all() or (tokens and not torch.isfinite(t).all()):
                     raise RuntimeError(f"Non-finite extracted features in {path}")
                 n = len(images)
-                globals_[offset:offset+n] = g.float().cpu().numpy()
+                pending_globals.append(g.float().cpu().numpy())
                 if tokens:
-                    locals_[offset:offset+n] = t.float().cpu().numpy().astype(np.float16)
-                offset += n
-                if number % 100 == 0 or offset == len(items):
+                    pending_locals.append(t.float().cpu().numpy().astype(np.float16))
+                pending_count += n
+                if pending_count >= 3200 or offset + pending_count == len(items):
+                    globals_[offset:offset+pending_count] = np.concatenate(pending_globals)
+                    if tokens:
+                        locals_[offset:offset+pending_count] = np.concatenate(pending_locals)
                     globals_.flush()
                     if tokens:
                         locals_.flush()
+                    offset += pending_count
                     study._json(cursor, {"signature": signature, "offset": offset})
-                    print(f"[wood-large] {path.name}: {offset}/{len(items)}", flush=True)
+                    elapsed = max(time.perf_counter() - started, 1e-6)
+                    rate = (offset - start_offset) / elapsed
+                    print(f"[wood-large] {path.name}: {offset}/{len(items)} "
+                          f"({rate:.1f} images/s, batch={cfg['image_batch']}, "
+                          f"workers={cfg['workers']})", flush=True)
+                    pending_globals, pending_locals = [], []
+                    pending_count = 0
     if not np.isfinite(globals_).all() or (tokens and not np.isfinite(locals_).all()):
         raise RuntimeError(f"Non-finite completed feature cache: {path}")
     return np.load(path, mmap_mode="r"), (np.load(token_path, mmap_mode="r") if tokens else None)
@@ -500,6 +522,26 @@ def _macro_mrr(scores, truth):
                               for label in torch.unique(truth)]).mean())
 
 
+def _completed_gallery(folder, checkpoint_hash, manifest_hash, id_hash,
+                       query_limit, n_queries):
+    protocol_path = folder / "protocol.json"
+    if not protocol_path.is_file():
+        return False
+    protocol = json.loads(protocol_path.read_text())
+    expected = {"checkpoint_sha256": checkpoint_hash,
+                "manifest_sha256": manifest_hash, "id_csv_sha256": id_hash,
+                "query_limit_per_species": query_limit, "n_queries": n_queries,
+                "n_stage1_images": 176123, "n_species": 954}
+    if any(protocol.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Completed full-gallery protocol changed: {folder}")
+    for name in ("full954_summary.csv", "full954_queries.csv",
+                 "cardinality_curve.csv", "per_source.csv"):
+        path = folder / name
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(f"Incomplete full-gallery output: {path}")
+    return True
+
+
 def _evaluate_gallery(root, out, manifest, arm, seed, settings, device,
                       study_out, image_out):
     path, encoder, model, base_cfg, _ = _load_arm(
@@ -519,8 +561,16 @@ def _evaluate_gallery(root, out, manifest, arm, seed, settings, device,
     folder = out / "full954" / arm / f"seed_{seed}"
     cache = folder / "features"
     checkpoint_hash = study._hash_file(path)
-    extract_cfg = dict(base_cfg, image_batch=settings["image_batch"],
-                       workers=settings["workers"])
+    if _completed_gallery(folder, checkpoint_hash,
+                          study._hash_file(root / "swi_manifest.json"),
+                          study._hash_file(root / "ID_images_expanded.csv"),
+                          settings["max_queries_per_species"], len(query_items)):
+        print(f"[wood-large] verified completed full954 arm={arm}; skipping", flush=True)
+        return folder
+    eval_batch, eval_workers = _evaluation_io(settings)
+    extract_cfg = dict(base_cfg, image_batch=eval_batch, workers=eval_workers)
+    print(f"[wood-large] full954 extraction arm={arm} batch={eval_batch} "
+          f"workers={eval_workers}", flush=True)
     full_g, _ = _cache_features(encoder, full_items, extract_cfg, device,
                                cache / "swi_full.npy", checkpoint_hash, False)
     refs_g, refs_t = _cache_features(encoder, balanced, extract_cfg, device,
@@ -640,6 +690,7 @@ def _evaluate_gallery(root, out, manifest, arm, seed, settings, device,
         "query_limit_per_species": settings["max_queries_per_species"],
         "n_queries": len(query_items), "n_stage1_images": len(full_items),
         "n_stage2_images": len(balanced), "n_species": 954,
+        "evaluation_image_batch": eval_batch, "evaluation_workers": eval_workers,
         "stage1_ms_per_query": 1000 * stage1_seconds / len(query_items),
         "timing_scope": "scoring precomputed embeddings only; image encoding excluded",
         "peak_gpu_gb": (torch.cuda.max_memory_allocated() / 2**30

@@ -5,7 +5,9 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -50,6 +52,111 @@ class CandidateMethodsTest(unittest.TestCase):
                          ("torch", "numpy", "pandas", "cv2", "albumentations")),
                      "Image-study dependencies unavailable")
 class LargeGalleryProtocolTest(unittest.TestCase):
+    def test_feature_cache_flushes_chunks_and_resumes_exact_rows(self):
+        import numpy as np
+        import torch
+        from swid_retrieval import wood_large_gallery as large
+
+        items = [(f"image_{i}.jpg", "species") for i in range(3201)]
+        features = torch.arange(3201 * 512, dtype=torch.float32).reshape(3201, 512)
+
+        class Batches:
+            def __init__(self, offset):
+                self.dataset = SimpleNamespace(loader=None)
+                self.offset = offset
+
+            def __iter__(self):
+                if self.offset == 0:
+                    yield features[:3200], None
+                    raise RuntimeError("Interrupted after the first durable chunk")
+                yield features[self.offset:], None
+
+        def loader(remaining, cfg):
+            return Batches(len(items) - len(remaining))
+
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "features.npy"
+            with patch.object(large.study, "_loader", side_effect=loader), \
+                 patch.object(large.study, "_autocast", return_value=nullcontext()):
+                with self.assertRaisesRegex(RuntimeError, "Interrupted"):
+                    large._cache_features(torch.nn.Identity(), items,
+                                          {"image_batch": 64, "workers": 0},
+                                          torch.device("cpu"), cache, "checkpoint", False)
+                cursor = json.loads(cache.with_suffix(".progress.json").read_text())
+                self.assertEqual(cursor["offset"], 3200)
+                output, _ = large._cache_features(
+                    torch.nn.Identity(), items, {"image_batch": 128, "workers": 4},
+                    torch.device("cpu"), cache, "checkpoint", False)
+            np.testing.assert_array_equal(output, features.numpy())
+
+    def test_feature_cache_buffers_reference_tokens(self):
+        import numpy as np
+        import torch
+        from swid_retrieval import wood_large_gallery as large
+
+        items = [(f"image_{i}.jpg", "species") for i in range(3)]
+        features = torch.arange(3 * 512, dtype=torch.float32).reshape(3, 512)
+
+        class Batches:
+            dataset = SimpleNamespace(loader=None)
+
+            def __iter__(self):
+                yield features[:2], None
+                yield features[2:], None
+
+        def encode(encoder, images):
+            return images, images[:, None, :].expand(-1, 16, -1)
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(large.study, "_loader", return_value=Batches()), \
+                 patch.object(large.study, "_autocast", return_value=nullcontext()), \
+                 patch.object(large.corr, "_encode_images", side_effect=encode):
+                global_emb, tokens = large._cache_features(
+                    torch.nn.Identity(), items, {"image_batch": 2, "workers": 0},
+                    torch.device("cpu"), Path(folder) / "refs.npy", "checkpoint", True)
+            np.testing.assert_array_equal(global_emb, features.numpy())
+            np.testing.assert_array_equal(tokens,
+                                          features.numpy()[:, None, :].repeat(16, axis=1)
+                                          .astype(np.float16))
+
+    def test_completed_gallery_skips_only_verified_artifacts(self):
+        from swid_retrieval import wood_large_gallery as large
+
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder)
+            self.assertFalse(large._completed_gallery(out, "checkpoint", "manifest",
+                                                     "id", 0, 6189))
+            (out / "protocol.json").write_text(json.dumps({
+                "checkpoint_sha256": "checkpoint", "manifest_sha256": "manifest",
+                "id_csv_sha256": "id", "query_limit_per_species": 0,
+                "n_queries": 6189, "n_stage1_images": 176123, "n_species": 954}))
+            for name in ("full954_summary.csv", "full954_queries.csv",
+                         "cardinality_curve.csv", "per_source.csv"):
+                (out / name).write_text("header\nvalue\n")
+            self.assertTrue(large._completed_gallery(out, "checkpoint", "manifest",
+                                                    "id", 0, 6189))
+            with self.assertRaises(ValueError):
+                large._completed_gallery(out, "changed", "manifest", "id", 0, 6189)
+            (out / "per_source.csv").unlink()
+            with self.assertRaises(RuntimeError):
+                large._completed_gallery(out, "checkpoint", "manifest", "id", 0, 6189)
+
+    def test_full_gallery_io_overrides_do_not_change_locked_settings(self):
+        from swid_retrieval import wood_large_gallery as large
+
+        settings = {"image_batch": 32, "workers": 2}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WOOD_LARGE_EVAL_IMAGE_BATCH", None)
+            os.environ.pop("WOOD_LARGE_EVAL_WORKERS", None)
+            self.assertEqual(large._evaluation_io(settings), (32, 2))
+        with patch.dict(os.environ, {"WOOD_LARGE_EVAL_IMAGE_BATCH": "64",
+                                     "WOOD_LARGE_EVAL_WORKERS": "8"}):
+            self.assertEqual(large._evaluation_io(settings), (64, 8))
+        self.assertEqual(settings, {"image_batch": 32, "workers": 2})
+        with patch.dict(os.environ, {"WOOD_LARGE_EVAL_IMAGE_BATCH": "0"}):
+            with self.assertRaises(ValueError):
+                large._evaluation_io(settings)
+
     def test_locked_inference_accepts_only_exact_pre_retry_runner(self):
         from swid_retrieval import wood_large_gallery as large
 

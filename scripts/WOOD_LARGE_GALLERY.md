@@ -134,6 +134,31 @@ The inference loader accepts the exact training-runner hash from before the
 read-retry change, while continuing to verify the source checkpoint, manifest,
 method, arm, seed, settings, selection lock and selected checkpoint hash.
 
+If extraction is I/O-bound, interrupt the running Colab cell without resetting
+the runtime, pull the current code, clear loaded `swid_retrieval` modules, and
+resume `full954` with inference-only throughput overrides:
+
+```python
+os.environ["WOOD_LARGE_EVAL_IMAGE_BATCH"] = "64"
+os.environ["WOOD_LARGE_EVAL_WORKERS"] = "8"
+os.environ["WOOD_LARGE_MODE"] = "full954"
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+```
+
+These overrides are not training hyperparameters and do not alter the locked
+study plan or cache identity. The old `WOOD_LARGE_IMAGE_BATCH` and
+`WOOD_LARGE_WORKERS` values must remain unchanged. Extraction resumes from the
+last flushed image cursor, with at most roughly 3,200 images repeated after an
+interrupt. An arm with a matching `protocol.json` and all four result CSVs is
+skipped rather than rescored on resume. The log reports images/s for each
+cache; compare two intervals before keeping the new settings. On a
+CPU-constrained Colab runtime, 8 workers may be slower than 4. Embeddings are
+buffered in RAM and written to the Drive-backed `.npy` cache in roughly
+3,200-image chunks rather than one small write per batch. A larger batch uses
+more VRAM but cannot by itself fix slow Google Drive reads. Keep the runtime
+alive so `/content/cache_images` remains available. Do not delete any `.npy`
+or `.progress.json` files.
+
 ```python
 for mode in ("meta_test", "full954", "export"):
     os.environ["WOOD_LARGE_MODE"] = mode
