@@ -50,6 +50,42 @@ class CandidateMethodsTest(unittest.TestCase):
                          ("torch", "numpy", "pandas", "cv2", "albumentations")),
                      "Image-study dependencies unavailable")
 class LargeGalleryProtocolTest(unittest.TestCase):
+    def test_large_gallery_image_read_retries_without_skipping(self):
+        from swid_retrieval import wood_large_gallery as large
+
+        class TransientLoader:
+            def __init__(self):
+                self.calls = 0
+
+            def load(self, path):
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError(f"Failed to read image: {path}")
+                return path
+
+        original = TransientLoader()
+        with patch.object(large.time, "sleep") as sleep:
+            self.assertEqual(large._RetryImageLoader(original).load("image.jpg"),
+                             "image.jpg")
+        self.assertEqual(original.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_large_gallery_image_read_failure_preserves_cohort(self):
+        from swid_retrieval import wood_large_gallery as large
+
+        class MissingLoader:
+            def load(self, path):
+                raise RuntimeError(f"Failed to read image: {path}")
+
+            def _cache_path(self, path):
+                return Path(path + ".cache")
+
+        with tempfile.TemporaryDirectory() as folder:
+            missing = str(Path(folder) / "missing.jpg")
+            with patch.object(large.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "source_exists=False"):
+                    large._RetryImageLoader(MissingLoader()).load(missing)
+
     def test_settings_survive_json_round_trip(self):
         from swid_retrieval import wood_large_gallery as large
         settings = large._settings()

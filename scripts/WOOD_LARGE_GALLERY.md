@@ -120,6 +120,17 @@ gallery and public-ID embeddings separately for each evaluated encoder; it
 can take substantial time and Drive space. The cache is resumable. Do not set
 `WOOD_LARGE_QUERY_LIMIT_PER_SPECIES` above zero for the final result.
 
+If `full954` stops at `Failed to read image`, inspect the exact source path
+and its local cache copy before restarting. The extractor retries transient
+read failures three times and keeps the feature-cache cursor, so rerunning
+`full954` resumes from the last flushed batch. A persistently missing or
+unreadable source image must be restored from the original dataset; do not
+drop it, replace it with a different patch, or change the gallery cohort to
+make extraction finish. The local cache path is
+`data.CachedImageLoader()._cache_path(source_path)`; check both files with
+`Path.is_file()`, size, and `cv2.imread()`. Colab's `/content/cache_images`
+is runtime-local and may disappear after a disconnect.
+
 ```python
 for mode in ("meta_test", "full954", "export"):
     os.environ["WOOD_LARGE_MODE"] = mode
@@ -170,6 +181,14 @@ public-ID:
 - Stage-1 candidate recall and stage-2 conditional accuracy. If candidate
   recall@128 is below the target R@1, improve the encoder/candidate search;
   otherwise prioritize reranking and its query-reference loss.
+- For K=1, stratify paired query/reference outcomes by crop-level gap
+  (`abs(log2(scale_query / scale_reference))`), holding target species,
+  query, reference count and source-scan separation fixed where possible.
+  Report sample counts, R@1 and candidate recall in each stratum; compare
+  against same-level pairs before attributing any failure to scale. The
+  `scale_*` directory denotes source-image crop width in pixels, not optical
+  magnification. Check how many species have cross-level, cross-scan pairs
+  before designing a scale-specific training objective.
 
 Potential next loss ablation, only after the above diagnosis: add a hard-pair
 margin loss on QKV scores or distill QKV rankings into the global encoder.
@@ -177,3 +196,16 @@ Compare each against the unchanged current recipe (episode cross-entropy,
 global auxiliary loss, SupCon and prototype-bank loss), with matched seeds and
 meta-val-only selection. Do not add a generic contrastive term and attribute
 any gain to novel wood anatomy without a matching control.
+
+If a reproducible cross-level deficit remains after the paired analysis, test
+cross-level supervised contrastive learning as a separate next-round ablation.
+The existing SupCon pairs patch images by species label but does not enforce
+different crop levels; episodes enforce different source scans but do not
+stratify levels. Sample same-species positives from different levels and scans,
+with different-species negatives matched on level where feasible. Compare
+unchanged training, level-aware sampling alone, the added loss alone, and both,
+using matched seeds and meta-val-only tuning. Evaluate K=1 and K=5 across
+57/637/954-species galleries and by crop-level gap. Avoid forcing token-level
+correspondence across scans without anatomical alignment, or treating all
+crop levels as interchangeable when they expose different structures. Do not
+change the current locked run or claim a benefit before these controls pass.

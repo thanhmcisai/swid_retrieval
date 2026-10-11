@@ -378,6 +378,7 @@ def _cache_features(encoder, items, cfg, device, path, checkpoint_hash, tokens):
         raise ValueError("Feature cache shape/cursor mismatch")
     if offset < len(items):
         loader = study._loader(items[offset:], cfg)
+        loader.dataset.loader = _RetryImageLoader(loader.dataset.loader)
         encoder.eval()
         with torch.inference_mode():
             for number, (images, _) in enumerate(loader, 1):
@@ -402,6 +403,33 @@ def _cache_features(encoder, items, cfg, device, path, checkpoint_hash, tokens):
     if not np.isfinite(globals_).all() or (tokens and not np.isfinite(locals_).all()):
         raise RuntimeError(f"Non-finite completed feature cache: {path}")
     return np.load(path, mmap_mode="r"), (np.load(token_path, mmap_mode="r") if tokens else None)
+
+
+class _RetryImageLoader:
+    def __init__(self, loader, attempts=3):
+        self.loader = loader
+        self.attempts = attempts
+
+    def load(self, path):
+        for attempt in range(self.attempts):
+            try:
+                return self.loader.load(path)
+            except RuntimeError as exc:
+                if "Failed to read image:" not in str(exc):
+                    raise
+                if attempt + 1 < self.attempts:
+                    time.sleep(2 ** attempt)
+        source = Path(path)
+        cached = self.loader._cache_path(path)
+        raise RuntimeError(
+            f"Failed to read image after {self.attempts} attempts: {path}; "
+            f"source_exists={source.is_file()}, "
+            f"source_bytes={source.stat().st_size if source.is_file() else None}, "
+            f"cache_exists={cached.is_file()}, "
+            f"cache_bytes={cached.stat().st_size if cached.is_file() else None}. "
+            "Restore the exact image or its matching local image cache, then "
+            "rerun full954; the feature-cache cursor will resume extraction."
+        )
 
 
 def _balanced_gallery(items, limit=5):
