@@ -22,6 +22,11 @@ from .wood_large_gallery_methods import (candidate_recall, candidate_union,
                                          class_scores, rerank_candidates)
 
 
+_PRE_RETRY_RUNNER_SHA256 = (
+    "7c172dd0e7337ef1851d71afb71c1da2480ca3f5cf4b64b97f816c043623a925"
+)
+
+
 def _settings():
     cfg = {
         "epochs": int(os.environ.get("WOOD_LARGE_EPOCHS", "3")),
@@ -82,6 +87,15 @@ def _provenance(root, source_path, arm, seed, cfg):
             "method_sha256": study._hash_file(Path(corr.__file__).with_name(
                 "wood_correspondence_method.py")),
             "arm": arm, "seed": seed, "settings": cfg}
+
+
+def _inference_provenance_matches(saved, expected):
+    if saved == expected:
+        return True
+    if saved.get("runner_sha256") != _PRE_RETRY_RUNNER_SHA256:
+        return False
+    return {key: value for key, value in saved.items() if key != "runner_sha256"} == {
+        key: value for key, value in expected.items() if key != "runner_sha256"}
 
 
 def _bank(encoder, model, representatives, base_cfg, device):
@@ -336,8 +350,9 @@ def _load_arm(root, study_out, image_out, out, arm, seed, device):
         if not path.is_file():
             raise FileNotFoundError(f"Missing trained arm checkpoint: {path}")
         saved = torch.load(path, map_location="cpu", weights_only=False)
-        if saved["provenance"] != _provenance(
-                root, source, arm, seed, saved["provenance"]["settings"]):
+        if not _inference_provenance_matches(
+                saved["provenance"], _provenance(
+                    root, source, arm, seed, saved["provenance"]["settings"])):
             raise ValueError("Hard-negative checkpoint provenance mismatch")
         encoder.load_state_dict(saved["encoder"], strict=True)
         model.load_state_dict(saved["model"], strict=True)

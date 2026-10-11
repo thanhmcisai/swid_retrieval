@@ -50,6 +50,25 @@ class CandidateMethodsTest(unittest.TestCase):
                          ("torch", "numpy", "pandas", "cv2", "albumentations")),
                      "Image-study dependencies unavailable")
 class LargeGalleryProtocolTest(unittest.TestCase):
+    def test_locked_inference_accepts_only_exact_pre_retry_runner(self):
+        from swid_retrieval import wood_large_gallery as large
+
+        expected = {"runner_sha256": "current", "source_checkpoint_sha256": "source",
+                    "manifest_sha256": "manifest", "method_sha256": "method",
+                    "arm": "hard_bank", "seed": 43, "settings": {"episodes": 300}}
+        previous = dict(expected, runner_sha256=large._PRE_RETRY_RUNNER_SHA256)
+        self.assertTrue(large._inference_provenance_matches(expected, expected))
+        self.assertTrue(large._inference_provenance_matches(previous, expected))
+        self.assertFalse(large._inference_provenance_matches(
+            dict(previous, runner_sha256="other"), expected))
+        for field, value in (("source_checkpoint_sha256", "different"),
+                             ("manifest_sha256", "different"),
+                             ("method_sha256", "different"),
+                             ("arm", "random_bank"), ("seed", 42),
+                             ("settings", {"episodes": 60})):
+            self.assertFalse(large._inference_provenance_matches(
+                dict(previous, **{field: value}), expected), field)
+
     def test_large_gallery_image_read_retries_without_skipping(self):
         from swid_retrieval import wood_large_gallery as large
 

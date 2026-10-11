@@ -130,6 +130,9 @@ make extraction finish. The local cache path is
 `data.CachedImageLoader()._cache_path(source_path)`; check both files with
 `Path.is_file()`, size, and `cv2.imread()`. Colab's `/content/cache_images`
 is runtime-local and may disappear after a disconnect.
+The inference loader accepts the exact training-runner hash from before the
+read-retry change, while continuing to verify the source checkpoint, manifest,
+method, arm, seed, settings, selection lock and selected checkpoint hash.
 
 ```python
 for mode in ("meta_test", "full954", "export"):
