@@ -51,7 +51,11 @@ for name in list(sys.modules):
     if name.startswith("swid_retrieval"):
         del sys.modules[name]
 for name in list(os.environ):
-    if name.startswith("RUN_WOOD_"):
+    if name.startswith("RUN_WOOD_") or name in {
+        "RUN_FINAL_SCURD_RETRAIN", "RUN_FINAL_COLAB_AUDIT",
+        "RUN_REPAIR_PUBLIC_ROWS", "RUN_GALLERY_STUDY",
+        "RUN_GALLERY_DIAGNOSTICS",
+    }:
         os.environ.pop(name, None)
 
 os.environ.update({
