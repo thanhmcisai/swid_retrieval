@@ -6,6 +6,8 @@ previous hard-shortlist run. Only the number of episodes per epoch changes.
 
 import json
 import os
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -13,9 +15,12 @@ import pandas as pd
 import torch
 
 from . import data, gallery_experiment as study
+from . import wood_correspondence_experiment as corr
 from . import wood_correspondence_image_train as image_train
 from . import wood_hard_negative as hard
 from . import wood_multilevel as ml
+from . import wood_reference_budget as budget
+from .wood_large_gallery_methods import class_scores
 
 
 ARM = "random16"
@@ -172,11 +177,10 @@ def _endpoint(frame):
     return rows
 
 
-def _paired_evidence(old, out, samples=10000):
-    old_dir = old / "validation" / ARM
-    new_dir = out / "validation" / ARM
-    for folder, checkpoint in ((old_dir, old / "train" / ARM / "best.pt"),
-                               (new_dir, out / "train" / ARM / "best.pt")):
+def _paired_report(old_dir, old_checkpoint, new_dir, new_checkpoint,
+                   samples=10000):
+    for folder, checkpoint in ((old_dir, old_checkpoint),
+                               (new_dir, new_checkpoint)):
         protocol = json.loads((folder / "protocol.json").read_text())
         if (protocol["checkpoint_sha256"] != study._hash_file(checkpoint) or
                 protocol["folds"] != [0, 1] or
@@ -230,13 +234,167 @@ def _paired_evidence(old, out, samples=10000):
                 new_dir / "summary.csv")}
 
 
+def _paired_evidence(old, out, samples=10000):
+    return _paired_report(old / "validation" / ARM,
+                          old / "train" / ARM / "best.pt",
+                          out / "validation" / ARM,
+                          out / "train" / ARM / "best.pt", samples)
+
+
+def _validate_latest(root, out, manifest, encoder, model, base_cfg, cfg,
+                     latest_path, device):
+    folder = out / "checkpoint_audit" / "latest"
+    folder.mkdir(parents=True, exist_ok=True)
+    checkpoint_hash = study._hash_file(latest_path)
+    protocol = {"checkpoint_sha256": checkpoint_hash, "folds": [0, 1],
+                "budgets": [10], "widths": [128],
+                "reference_policy": "scan_scale", "shortlist": "raw_prototype",
+                "meta_val_only": True}
+    protocol_path = folder / "protocol.json"
+    if protocol_path.is_file():
+        if json.loads(protocol_path.read_text()) != protocol:
+            raise ValueError("Latest validation protocol changed")
+        if all((folder / name).is_file() for name in ("summary.csv", "per_query.csv")):
+            print("[wood-coverage] reusing latest-checkpoint validation", flush=True)
+            return folder
+    rows, query_rows = [], []
+    for fold in protocol["folds"]:
+        _, queries = study.validation_items(
+            manifest, group_mode="scan_disjoint", fold=fold)
+        refs = budget._reference_pool(manifest, queries)
+        class_names = sorted({label for _, label in refs})
+        if len(class_names) != 637 or len(queries) != 285:
+            raise ValueError("Meta-val cohort changed")
+        class_ids = {label: i for i, label in enumerate(class_names)}
+        selected = budget.select_indices(refs, 10, "scan_scale")
+        items = [refs[i] for i in selected]
+        ref_labels = torch.tensor([class_ids[label] for _, label in items],
+                                  device=device)
+        scans = [study.source_scan_id(path) for path, _ in items]
+        target_scans = defaultdict(set)
+        for path, label in items:
+            target_scans[label].add(study.source_scan_id(path))
+        if any(study.source_scan_id(path) in target_scans[study.canonical(label)]
+               for path, label in queries):
+            raise ValueError("Meta-val source-scan leakage")
+        rg, rt, qg, qt = hard._reference_data(
+            encoder, items, queries,
+            dict(base_cfg, image_batch=cfg["image_batch"], workers=cfg["workers"]),
+            device, folder / "features" / f"fold_{fold}", checkpoint_hash)
+        truth = torch.tensor([class_ids[study.canonical(label)]
+                              for _, label in queries], device=device)
+        with torch.inference_mode():
+            raw, _ = class_scores(qg, rg, ref_labels)
+            adapted, _ = class_scores(corr._transformed(model, qg),
+                                      corr._transformed(model, rg), ref_labels)
+        for method, width, scores, candidates, elapsed in (
+                ("raw_prototype", 0, raw, None, 0.0),
+                ("adapted_prototype", 0, adapted, None, 0.0)):
+            rows.append(hard._summary_row(ARM, fold, 10, width, method,
+                                          scores, truth, candidates, elapsed))
+            predictions = scores.argmax(dim=1).tolist()
+            for i, (path, label) in enumerate(queries):
+                query_rows.append({
+                    "arm": ARM, "fold": fold, "budget": 10, "width": width,
+                    "method": method, "query_path": path,
+                    "true_label": study.canonical(label),
+                    "predicted_label": class_names[predictions[i]],
+                    "correct": int(predictions[i] == int(truth[i])),
+                    "candidate_hit": None, "query_scale": study.image_scale(path)})
+        candidates = raw.topk(128, dim=1).indices
+        started = time.perf_counter()
+        with torch.inference_mode():
+            scores = ml.rerank_all_references(
+                model, qg, qt, rg, rt, ref_labels, scans, candidates, adapted)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = 1000 * (time.perf_counter() - started) / len(qg)
+        rows.append(hard._summary_row(ARM, fold, 10, 128, "qkv_all_refs",
+                                      scores, truth, candidates, elapsed))
+        predictions = scores.argmax(dim=1).tolist()
+        hits = (candidates == truth[:, None]).any(dim=1).tolist()
+        for i, (path, label) in enumerate(queries):
+            query_rows.append({
+                "arm": ARM, "fold": fold, "budget": 10, "width": 128,
+                "method": "qkv_all_refs", "query_path": path,
+                "true_label": study.canonical(label),
+                "predicted_label": class_names[predictions[i]],
+                "correct": int(predictions[i] == int(truth[i])),
+                "candidate_hit": hits[i], "query_scale": study.image_scale(path)})
+        print(f"[wood-coverage] latest fold={fold} K=10 top128 "
+              f"R@1={rows[-1]['macro_r1']:.4f}", flush=True)
+    pd.DataFrame(rows).to_csv(folder / "summary.csv", index=False)
+    pd.DataFrame(query_rows).to_csv(folder / "per_query.csv", index=False)
+    study._json(protocol_path, protocol)
+    return folder
+
+
+def _audit_latest(root, old, out, base_out, image_out, manifest, cfg):
+    if not torch.cuda.is_available():
+        raise RuntimeError("Latest-checkpoint audit requires CUDA")
+    train = out / "train" / ARM
+    best_path, latest_path = train / "best.pt", train / "latest.pt"
+    best = torch.load(best_path, map_location="cpu", weights_only=False)
+    latest = torch.load(latest_path, map_location="cpu", weights_only=False)
+    source, encoder, model, base_cfg, _ = hard._source(
+        root, base_out, image_out, cfg["seed"], torch.device("cuda"))
+    expected = hard._provenance(root, source, cfg, ARM)
+    if (best["provenance"] != expected or latest["provenance"] != expected or
+            latest["epoch"] != cfg["epochs"] or
+            best["epoch"] >= latest["epoch"]):
+        raise ValueError("Expected distinct best and final checkpoints from the completed run")
+    best_meta = json.loads((train / f"epoch_{best['epoch']:02d}_provenance.json").read_text())
+    latest_meta = json.loads((train / f"epoch_{latest['epoch']:02d}_provenance.json").read_text())
+    if (best_meta["provenance"] != expected or latest_meta["provenance"] != expected or
+            best["selection_score"] != best_meta["score"] or
+            latest["best_score"] != best["selection_score"]):
+        raise ValueError("Checkpoint and per-epoch validation evidence disagree")
+    best_dir = out / "validation" / ARM
+    if not all((best_dir / name).is_file() for name in
+               ("protocol.json", "summary.csv", "per_query.csv")):
+        raise ValueError("Evaluate best.pt with coverage validate mode first")
+    encoder.load_state_dict(latest["encoder"], strict=True)
+    model.load_state_dict(latest["model"], strict=True)
+    audit_dir = _validate_latest(root, out, manifest, encoder.eval(), model.eval(),
+                                 base_cfg, cfg, latest_path, torch.device("cuda"))
+    baseline_dir = old / "validation" / ARM
+    baseline_path = old / "train" / ARM / "best.pt"
+    reports = {
+        "baseline_vs_best": _paired_report(baseline_dir, baseline_path,
+                                          best_dir, best_path),
+        "baseline_vs_latest": _paired_report(baseline_dir, baseline_path,
+                                            audit_dir, latest_path),
+        "best_vs_latest": _paired_report(best_dir, best_path,
+                                        audit_dir, latest_path),
+    }
+    result = {
+        "selection_split": "meta-val", "test_evaluated": False,
+        "endpoint": ENDPOINT, "note": "Diagnostic only; latest was not selected before this audit",
+        "best_epoch": int(best["epoch"]), "latest_epoch": int(latest["epoch"]),
+        "best_selection_score": float(best_meta["score"]),
+        "latest_selection_score": float(latest_meta["score"]),
+        "best_epoch_unique_train_images": int(best_meta["unique_train_images"]),
+        "latest_epoch_unique_train_images": int(latest_meta["unique_train_images"]),
+        "best_checkpoint_sha256": study._hash_file(best_path),
+        "latest_checkpoint_sha256": study._hash_file(latest_path),
+        "latest_validation_protocol_sha256": study._hash_file(audit_dir / "protocol.json"),
+        "comparisons": reports,
+    }
+    path = out / "checkpoint_audit" / "comparison.json"
+    if path.is_file() and json.loads(path.read_text()) != result:
+        raise ValueError("Latest-checkpoint audit changed; use a new output folder")
+    study._json(path, result)
+    print(f"[wood-coverage] checkpoint audit: {path}", flush=True)
+    return result
+
+
 def run():
     root = Path(os.environ.get("ROOT_PATH", "/content/drive/MyDrive/NCS")).resolve()
     old, out, ml_out, base_out, image_out = _paths(root)
     cfg = _config()
     mode = os.environ.get("WOOD_COVERAGE_MODE", "preflight")
-    if mode not in {"preflight", "train", "validate", "compare"}:
-        raise ValueError("WOOD_COVERAGE_MODE must be preflight/train/validate/compare")
+    if mode not in {"preflight", "train", "validate", "compare", "audit_latest"}:
+        raise ValueError("WOOD_COVERAGE_MODE must be preflight/train/validate/compare/audit_latest")
     manifest = data.load_swi_manifest(root / "swi_manifest.json")
     if mode == "preflight":
         _preflight(root, old, out, image_out, manifest, cfg)
@@ -267,6 +425,8 @@ def run():
             raise RuntimeError("Coverage validation requires CUDA")
         hard._validate_arm(root, out, ml_out, manifest, base_out, image_out,
                            cfg, ARM, torch.device("cuda"))
+    elif mode == "audit_latest":
+        _audit_latest(root, old, out, base_out, image_out, manifest, cfg)
     else:
         report = _paired_evidence(old, out)
         path = out / "coverage_comparison.json"

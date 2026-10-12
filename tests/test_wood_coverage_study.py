@@ -116,6 +116,79 @@ class CoverageStudyTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "checkpoint mismatch"):
                 coverage._paired_evidence(old, out, samples=100)
 
+    def test_latest_validation_reuses_only_matching_checkpoint(self):
+        import torch
+        from swid_retrieval import wood_coverage_study as coverage
+        from swid_retrieval import gallery_experiment as study
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "latest.pt"
+            latest.write_bytes(b"epoch3")
+            folder = root / "checkpoint_audit" / "latest"
+            folder.mkdir(parents=True)
+            protocol = {
+                "checkpoint_sha256": study._hash_file(latest),
+                "folds": [0, 1], "budgets": [10], "widths": [128],
+                "reference_policy": "scan_scale", "shortlist": "raw_prototype",
+                "meta_val_only": True}
+            (folder / "protocol.json").write_text(json.dumps(protocol))
+            (folder / "summary.csv").write_text("summary")
+            (folder / "per_query.csv").write_text("queries")
+            with patch.object(coverage.study, "validation_items",
+                              side_effect=AssertionError("inference reran")):
+                self.assertEqual(coverage._validate_latest(
+                    root, root, {}, None, None, {}, {}, latest,
+                    torch.device("cpu")), folder)
+            latest.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "protocol changed"):
+                coverage._validate_latest(root, root, {}, None, None,
+                                          {}, {}, latest, torch.device("cpu"))
+
+    def test_latest_validation_writes_matched_query_schema(self):
+        import pandas as pd
+        import torch
+        from swid_retrieval import wood_coverage_study as coverage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest = root / "latest.pt"
+            latest.write_bytes(b"epoch3")
+            refs = [(f"/refs/{i}.jpg", f"species_{i:03d}") for i in range(637)]
+            queries = [(f"/queries/{fold}_{i}.jpg", f"species_{i // 5:03d}")
+                       for fold in (0, 1) for i in range(285)]
+            embeddings = torch.eye(637)
+            def reference_data(_encoder, items, current, *_args):
+                labels = [int(label.split("_")[1]) for _, label in current]
+                return (embeddings, embeddings[:, :1, None],
+                        embeddings[labels], embeddings[labels, :1, None])
+            with patch.object(coverage.study, "validation_items",
+                              side_effect=[(None, queries[:285]),
+                                           (None, queries[285:])]), \
+                 patch.object(coverage.budget, "_reference_pool", return_value=refs), \
+                 patch.object(coverage.budget, "select_indices",
+                              return_value=list(range(637))), \
+                 patch.object(coverage.hard, "_reference_data",
+                              side_effect=reference_data), \
+                 patch.object(coverage.corr, "_transformed", side_effect=lambda _m, x: x), \
+                 patch.object(coverage.ml, "rerank_all_references",
+                              side_effect=lambda _m, _q, _qt, _r, _rt, _l,
+                              _s, _c, adapted: adapted), \
+                 patch.object(coverage.study, "source_scan_id", side_effect=lambda p: p), \
+                 patch.object(coverage.study, "image_scale", return_value=256):
+                folder = coverage._validate_latest(
+                    root, root, {}, None, None, {},
+                    {"image_batch": 16, "workers": 0}, latest,
+                    torch.device("cpu"))
+            summary = pd.read_csv(folder / "summary.csv")
+            per_query = pd.read_csv(folder / "per_query.csv")
+            self.assertEqual(len(summary), 6)
+            self.assertEqual(len(per_query), 1710)
+            self.assertEqual(set(summary.method),
+                             {"raw_prototype", "adapted_prototype", "qkv_all_refs"})
+            self.assertTrue((summary.macro_r1 == 1.0).all())
+            self.assertEqual(set(per_query.fold), {0, 1})
+
 
 if __name__ == "__main__":
     unittest.main()

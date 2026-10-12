@@ -116,3 +116,45 @@ files.download(str(bundle))
 
 The bundle excludes `.pt`, `.npy`, and image files. Keep the checkpoint on Drive
 for later held-out evaluation.
+
+## Audit the final epoch without retraining
+
+The initial run saved `best.pt` from epoch 1 and `latest.pt` from epoch 3.
+Epoch 2's `candidate.pt` was overwritten, so epoch 2 cannot be recovered from
+this run. The `audit_latest` mode evaluates only epoch 3 on the same meta-val
+queries at the predeclared K=10/top-128 endpoint. It does not replace the
+selected checkpoint and does not evaluate meta-test or public-ID. The result
+is diagnostic, not an independent model-selection result.
+
+On a fresh runtime, rerun cell 1 to restore the configuration, then:
+
+```python
+import os, runpy
+os.environ["WOOD_COVERAGE_MODE"] = "audit_latest"
+_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+```
+
+To download the small audit files:
+
+```python
+import zipfile
+from pathlib import Path
+from google.colab import files
+
+out = Path("/content/drive/MyDrive/NCS/results/wood_coverage_random16_v1")
+audit = out / "checkpoint_audit"
+assert (audit / "comparison.json").is_file()
+bundle = out.parent / "wood_coverage_latest_audit_review.zip"
+with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
+    for path in sorted(audit.rglob("*")):
+        if path.is_file() and path.suffix in {".json", ".csv"}:
+            z.write(path, path.relative_to(out.parent))
+    for name in ("preflight.json", "coverage_comparison.json",
+                 "validation/random16/protocol.json",
+                 "validation/random16/summary.csv"):
+        path = out / name
+        assert path.is_file(), path
+        z.write(path, path.relative_to(out.parent))
+print(bundle, round(bundle.stat().st_size / 1e6, 2), "MB")
+files.download(str(bundle))
+```
