@@ -30,7 +30,7 @@ for name in list(sys.modules):
     if name.startswith("swid_retrieval"):
         del sys.modules[name]
 for name in list(os.environ):
-    if name.startswith("RUN_WOOD_"):
+    if name.startswith("RUN_"):
         os.environ.pop(name)
 
 os.environ.update({
