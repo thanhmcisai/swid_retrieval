@@ -1,24 +1,42 @@
-# Full-image ArcFace / QKV study
+# Full-image ArcFace, contrastive, and QKV ablations
 
-This isolated experiment uses **every one of the 124,577 meta-train images as a
-query once per epoch**. It does not read public-ID, meta-test, or the 954-label
-CE training pool. Both arms start from the same DINOv2-S retrieval checkpoint,
-use the same class-balanced full-coverage batches and the same paired reference
-plan. A positive reference is a different image of the same species; another
-source scan is preferred and a different crop scale is preferred when available.
-Species with only one source scan necessarily use a same-scan positive; this is
-counted in the epoch audit.
+This study visits every one of the 124,577 meta-train images as a query once
+per epoch. It uses no public-ID, meta-test, or 954-label CE training images.
+Every arm starts from the same DINOv2-S checkpoint (source seed 43, including
+the runs labelled training seeds 42 and 44) and uses the same paired
+reference plan. A reference is another image of the same species; a different
+source scan and crop scale are preferred when available. Same-scan fallbacks
+are counted in each epoch's pair audit.
 
-`arcface` optimizes the shared encoder with a 557-way angular-margin classifier.
-`arcface_qkv` adds the existing `WoodCorrespondence` scorer's in-batch QKV loss.
-Its query and reference images both backpropagate into the encoder. The QKV
-candidate set is **the distinct species in the current batch**, not all 557
-species. The ArcFace classifier supplies full-557 discrimination in both arms.
-There is no stale feature bank in this study. Validation uses two scan-disjoint
-meta-val folds at 57x5, 57x1 and 637x1; QKV reranks at most 128 candidates in
-the 637x1 condition. The 954-species test is not touched by this runner.
+| Arm | Additional objective or sampling |
+| --- | --- |
+| `arcface` | 557-way ArcFace control |
+| `arcface_qkv` | ArcFace plus in-batch QKV class-ranking loss |
+| `arcface_pair_nce` | ArcFace plus query-to-paired-reference InfoNCE; other same-class references are excluded from the negative denominator |
+| `arcface_supcon` | ArcFace plus symmetric supervised contrastive loss, using the control batch sampler |
+| `arcface_packed` | ArcFace only, using the multi-positive batch sampler |
+| `arcface_multipos` | ArcFace plus supervised contrastive loss over all query/reference views; pairs of query images from one species are packed into each batch where possible, preferring different scans and scales |
+| `arcface_multipos_qkv` | Multi-positive arm plus the in-batch QKV loss |
 
-Run from Colab after Drive mount:
+All objectives backpropagate through the image encoder. The QKV training loss
+competes with the distinct reference classes in a batch, not all 557 classes;
+the ArcFace classifier provides 557-way discrimination in every arm. The
+multi-positive sampler has fewer distinct in-batch negative species than the
+control sampler. `arcface_packed` isolates this sampler effect; `arcface_supcon`
+isolates the contrastive objective without packing. Candidate-class and
+positive-view counts are logged. No stale feature bank is used.
+
+Selection uses the mean R@1 across two scan-disjoint meta-val folds at 57x5,
+57x1, and 637x1. After training, `validate` exports per-query predictions for
+these three standard galleries. It also compares K=1/3/5/10 with nested
+scan-hash and scan/scale-diverse reference selection. The same 285 queries per
+fold are used across K and policies. Both global and QKV scoring are reported
+for QKV arms, as are candidate recall@32/@128 and R@1 conditional on candidate
+inclusion. The 954-species and held-out meta-test datasets are not used here.
+
+Run from Colab after mounting Drive. Use a **new** output folder: changes to
+the runner are part of checkpoint provenance and old study folders cannot be
+resumed with this version.
 
 ```python
 %cd /content/drive/MyDrive/NCS
@@ -37,32 +55,39 @@ os.environ.update({
     "DEVICE": "cuda",
     "RUN_WOOD_FULL_IMAGE_TRAIN": "1",
     "WOOD_FULL_MODE": "preflight",
-    "WOOD_FULL_OUT": "/content/drive/MyDrive/NCS/results/wood_full_image_study_v1",
+    "WOOD_FULL_OUT": "/content/drive/MyDrive/NCS/results/wood_full_image_ablation_v2",
     "WOOD_FULL_SOURCE_OUT": "/content/drive/MyDrive/NCS/results/dinov2s_retrieval_matched_v1",
     "WOOD_FULL_SOURCE_SEED": "43",
-    "WOOD_FULL_ARMS": "arcface,arcface_qkv",
-    "WOOD_FULL_SEEDS": "43",
-    "WOOD_FULL_EPOCHS": "1",
+    "WOOD_FULL_ARMS": "arcface,arcface_qkv,arcface_pair_nce,arcface_supcon,arcface_packed,arcface_multipos,arcface_multipos_qkv",
+    "WOOD_FULL_SEEDS": "42,43,44",
+    "WOOD_FULL_EPOCHS": "3",
     "WOOD_FULL_BATCH": "64",
     "WOOD_FULL_MICROBATCH": "16",
     "WOOD_FULL_WORKERS": "2",
     "WOOD_FULL_PRELOAD": "1",
     "WOOD_FULL_PRELOAD_WORKERS": "8",
+    "WOOD_FULL_CONTRASTIVE_WEIGHT": "0.2",
+    "WOOD_FULL_CONTRASTIVE_TEMPERATURE": "0.07",
+    "WOOD_FULL_QKV_WEIGHT": "0.5",
 })
 _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
 ```
 
-Then run the training cell:
+Then run the entire study in one cell. Re-running resumes completed training
+epochs. It leaves checkpoints on Drive and exports only small reports:
 
 ```python
-os.environ["WOOD_FULL_MODE"] = "train"
-_ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+for mode in ("train", "validate", "export"):
+    os.environ["WOOD_FULL_MODE"] = mode
+    _ = runpy.run_module("swid_retrieval.run_overnight", run_name="__main__")
+print(os.environ["WOOD_FULL_OUT"] + "/wood_full_image_ablation_review.zip")
 ```
 
-First run one epoch to observe throughput and validation. To continue, change
-`WOOD_FULL_EPOCHS` to `3` and rerun the training cell. Completed epochs are
-resumed from `latest.pt`; batch size, microbatch, source checkpoint and loss
-weights are locked by checkpoint provenance. Each arm has `best.pt`,
-`latest.pt`, `epoch_XX.json`; `provenance.json` records the source and manifest.
-Do not cite this as an independent final result until multiple seeds and the
-locked meta-test/full-gallery evaluation are run.
+Seven arms times three seeds is expensive on a T4. For a throughput pilot, use
+only `arcface_pair_nce,arcface_multipos` and seed `43` in a separate output
+folder. Do not change the source, losses, batch size, or other recipe values
+inside an existing folder; the provenance guard rejects such changes. The
+review ZIP contains JSON/CSV reports, not weights or embedding arrays.
+These are fine-tuning seeds from a shared source encoder, not independent
+backbone-pretraining replications. Do not select a loss, scorer, or reference
+policy using meta-test or public-ID.
