@@ -18,7 +18,8 @@ from .wood_correspondence_method import WoodCorrespondence
 
 
 ARMS = ("arcface", "arcface_qkv", "arcface_pair_nce", "arcface_supcon",
-        "arcface_packed", "arcface_multipos", "arcface_multipos_qkv")
+        "arcface_packed", "arcface_multipos", "arcface_multipos_qkv",
+        "arcface_pair_nce_random")
 
 
 def _config():
@@ -29,6 +30,7 @@ def _config():
         "epochs": int(os.environ.get("WOOD_FULL_EPOCHS", "3")),
         "batch": int(os.environ.get("WOOD_FULL_BATCH", "64")),
         "microbatch": int(os.environ.get("WOOD_FULL_MICROBATCH", "16")),
+        "step_mode": os.environ.get("WOOD_FULL_STEP_MODE", "replay"),
         "workers": int(os.environ.get("WOOD_FULL_WORKERS", "2")),
         "backbone_lr": float(os.environ.get("WOOD_FULL_BACKBONE_LR", "2e-6")),
         "head_lr": float(os.environ.get("WOOD_FULL_HEAD_LR", "1e-4")),
@@ -42,7 +44,8 @@ def _config():
     if (not cfg["arms"] or len(set(cfg["arms"])) != len(cfg["arms"]) or
             any(x not in ARMS for x in cfg["arms"]) or not cfg["seeds"] or
             cfg["epochs"] < 1 or cfg["batch"] < 2 or cfg["microbatch"] < 1 or
-            cfg["workers"] < 0 or cfg["backbone_lr"] <= 0 or cfg["head_lr"] <= 0 or
+            cfg["workers"] < 0 or cfg["step_mode"] not in {"direct", "replay"} or
+            cfg["backbone_lr"] <= 0 or cfg["head_lr"] <= 0 or
             cfg["arcface_weight"] <= 0 or cfg["qkv_weight"] <= 0 or
             cfg["contrastive_weight"] <= 0 or cfg["contrastive_temperature"] <= 0 or
             cfg["print_every"] < 1):
@@ -50,12 +53,14 @@ def _config():
     return cfg
 
 
-def reference_plan(items, seed, epoch):
+def reference_plan(items, seed, epoch, scale_policy="cross_scale"):
     """Each source image is a query once; select a distinct same-species reference."""
     groups = defaultdict(list)
     for index, (_, label) in enumerate(items):
         groups[study.canonical(label)].append(index)
     rng = np.random.default_rng(seed * 100003 + epoch)
+    if scale_policy not in {"cross_scale", "random"}:
+        raise ValueError("Unknown positive scale policy")
     scans = [study.source_scan_id(path) for path, _ in items]
     scales = [study.image_scale(path) for path, _ in items]
     result = np.empty(len(items), dtype=np.int64)
@@ -72,13 +77,15 @@ def reference_plan(items, seed, epoch):
             if not eligible:
                 eligible = [j for j in indices if j != index]
             other_scale = [j for j in eligible if scales[j] != scales[index]]
-            chosen = int(rng.choice(other_scale if other_scale else eligible))
+            pool = other_scale if scale_policy == "cross_scale" and other_scale else eligible
+            chosen = int(rng.choice(pool))
             result[index] = chosen
             cross_scan += scans[index] != scans[chosen]
             cross_scale += scales[index] != scales[chosen]
     return result, {"query_images": len(items), "cross_scan_pairs": cross_scan,
                     "cross_scale_pairs": cross_scale,
-                    "same_scan_fallback_pairs": len(items) - cross_scan}
+                    "same_scan_fallback_pairs": len(items) - cross_scan,
+                    "scale_policy": scale_policy}
 
 
 def class_balanced_batches(items, batch_size, seed):
@@ -220,7 +227,7 @@ def _loss(model, classifier, globals_, tokens, labels, arm, weight,
                         torch.cat((labels, labels.new_tensor([extra_label]))))
     arcface = (classifier(q, labels) + classifier(r, reference_labels)) / 2
     contrastive = None
-    if arm == "arcface_pair_nce":
+    if arm in {"arcface_pair_nce", "arcface_pair_nce_random"}:
         contrastive = _pair_nce(q, r[:batch], labels, temperature)
     elif arm in {"arcface_supcon", "arcface_multipos", "arcface_multipos_qkv"}:
         contrastive = _multi_positive_nce(q, r[:batch], labels, temperature)
@@ -252,7 +259,7 @@ def _loss(model, classifier, globals_, tokens, labels, arm, weight,
 
 
 def _step(encoder, model, classifier, batch, arm, cfg, optimizer, device,
-          extra_reference=None):
+          extra_reference=None, scaler=None):
     query, reference, labels, _ = batch
     labels = labels.to(device, non_blocking=True)
     extra_label = None
@@ -261,15 +268,24 @@ def _step(encoder, model, classifier, batch, arm, cfg, optimizer, device,
         reference = torch.cat((reference, image[None]), dim=0)
     images = torch.cat((query, reference), dim=0)
     optimizer.zero_grad(set_to_none=True)
+    replay = cfg.get("step_mode", "replay") == "replay"
     global_parts, token_parts = [], []
-    with torch.no_grad():
+    if replay:
+        with torch.no_grad():
+            for chunk in images.split(cfg["microbatch"]):
+                with study._autocast(device):
+                    g, t = corr._encode_images(encoder, chunk.to(device, non_blocking=True))
+                global_parts.append(g.float())
+                token_parts.append(t.float())
+        globals_ = torch.cat(global_parts).detach().requires_grad_(True)
+        tokens = torch.cat(token_parts).detach().requires_grad_(True)
+    else:
         for chunk in images.split(cfg["microbatch"]):
             with study._autocast(device):
                 g, t = corr._encode_images(encoder, chunk.to(device, non_blocking=True))
             global_parts.append(g.float())
             token_parts.append(t.float())
-    globals_ = torch.cat(global_parts).detach().requires_grad_(True)
-    tokens = torch.cat(token_parts).detach().requires_grad_(True)
+        globals_, tokens = torch.cat(global_parts), torch.cat(token_parts)
     loss, metrics = _loss(model, classifier, globals_, tokens, labels,
                           arm, cfg["qkv_weight"], extra_label,
                           cfg.get("contrastive_weight", 0.2),
@@ -277,22 +293,29 @@ def _step(encoder, model, classifier, batch, arm, cfg, optimizer, device,
                           cfg.get("arcface_weight", 1.0))
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite full-image loss")
-    loss.backward()
-    gg = globals_.grad.detach()
-    tg = tokens.grad.detach() if tokens.grad is not None else torch.zeros_like(tokens)
-    if not torch.isfinite(gg).all() or not torch.isfinite(tg).all():
-        raise RuntimeError("Non-finite encoder gradient")
-    offset = 0
-    for chunk in images.split(cfg["microbatch"]):
-        size = len(chunk)
-        with study._autocast(device):
-            g, t = corr._encode_images(encoder, chunk.to(device, non_blocking=True))
-        torch.autograd.backward((g.float(), t.float()),
-                                (gg[offset:offset + size], tg[offset:offset + size]))
-        offset += size
+    (scaler.scale(loss) if scaler is not None else loss).backward()
+    if replay:
+        gg = globals_.grad.detach()
+        tg = tokens.grad.detach() if tokens.grad is not None else torch.zeros_like(tokens)
+        if not torch.isfinite(gg).all() or not torch.isfinite(tg).all():
+            raise RuntimeError("Non-finite encoder gradient")
+        offset = 0
+        for chunk in images.split(cfg["microbatch"]):
+            size = len(chunk)
+            with study._autocast(device):
+                g, t = corr._encode_images(encoder, chunk.to(device, non_blocking=True))
+            torch.autograd.backward((g.float(), t.float()),
+                                    (gg[offset:offset + size], tg[offset:offset + size]))
+            offset += size
+    if scaler is not None:
+        scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(
         list(encoder.parameters()) + list(model.parameters()) + list(classifier.parameters()), 1.0)
-    optimizer.step()
+    if scaler is None:
+        optimizer.step()
+    else:
+        scaler.step(optimizer)
+        scaler.update()
     return float(loss.detach()), metrics
 
 
@@ -350,10 +373,89 @@ def _validate(manifest, encoder, model, base_cfg, arm, device):
     return {key: float(np.mean([part[key] for part in folds])) for key in folds[0]}
 
 
+def _benchmark(out, items, base_state, base_cfg, cfg, device):
+    if device.type != "cuda":
+        raise ValueError("The hardware benchmark requires CUDA")
+    choices = [(64, 16, "replay", 2), (64, 32, "replay", 2),
+               (64, 16, "direct", 2), (64, 32, "direct", 2),
+               (64, 32, "direct", 4), (64, 64, "direct", 2),
+               (128, 32, "replay", 2), (128, 32, "direct", 2)]
+    steps = int(os.environ.get("WOOD_FULL_BENCH_STEPS", "3"))
+    if steps < 2:
+        raise ValueError("Benchmark needs at least two timed steps")
+    refs, _ = reference_plan(items, cfg["source_seed"], 1)
+    plans = {size: class_balanced_batches(items, size, cfg["source_seed"] * 100003 + 1)[:steps + 1]
+             for size in {choice[0] for choice in choices}}
+    needed = {items[i][0] for batches in plans.values() for batch in batches for i in batch}
+    needed.update(items[int(refs[i])][0] for batches in plans.values()
+                  for batch in batches for i in batch)
+    data.preload_image_cache(needed, max_workers=8, desc="Full-image hardware benchmark")
+    dataset = PairDataset(items, refs)
+    rows = []
+    for size, micro, mode, workers in choices:
+        encoder = model = classifier = optimizer = loader = iterator = None
+        try:
+            study._seed(cfg["source_seed"])
+            encoder = evidence._encoder_from_state(base_state, base_cfg, device)
+            model = WoodCorrespondence().to(device)
+            n_classes = len({study.canonical(label) for _, label in items})
+            classifier = ArcFaceClassifier(512, n_classes).to(device)
+            optimizer = torch.optim.AdamW([
+                {"params": encoder.parameters(), "lr": cfg["backbone_lr"]},
+                {"params": model.parameters(), "lr": cfg["head_lr"]},
+                {"params": classifier.parameters(), "lr": cfg["head_lr"]},
+            ])
+            scaler = torch.cuda.amp.GradScaler()
+            loader = DataLoader(dataset, batch_sampler=plans[size], num_workers=workers,
+                                pin_memory=True, prefetch_factor=2)
+            torch.cuda.reset_peak_memory_stats(device)
+            iterator = iter(loader)
+            waits, compute = [], []
+            local_cfg = dict(cfg, microbatch=micro, step_mode=mode)
+            for index in range(steps + 1):
+                start = time.perf_counter()
+                batch = next(iterator)
+                torch.cuda.synchronize(device)
+                wait = time.perf_counter() - start
+                start = time.perf_counter()
+                _step(encoder, model, classifier, batch, "arcface_qkv", local_cfg,
+                      optimizer, device, scaler=scaler)
+                torch.cuda.synchronize(device)
+                if index:
+                    waits.append(wait)
+                    compute.append(time.perf_counter() - start)
+            peak_gb = torch.cuda.max_memory_reserved(device) / 2 ** 30
+            rows.append({"batch": size, "microbatch": micro, "step_mode": mode,
+                         "workers": workers, "queries_per_second": size / float(np.mean(
+                             np.asarray(waits) + np.asarray(compute))),
+                         "data_wait_s": float(np.mean(waits)),
+                         "step_s": float(np.mean(compute)), "peak_reserved_gb": peak_gb,
+                         "status": "ok"})
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            rows.append({"batch": size, "microbatch": micro, "step_mode": mode,
+                         "workers": workers, "status": "oom"})
+        finally:
+            del iterator, loader, optimizer, classifier, model, encoder
+            torch.cuda.empty_cache()
+        print(f"[wood-full] benchmark {rows[-1]}", flush=True)
+    eligible = [row for row in rows if row["status"] == "ok" and
+                row["peak_reserved_gb"] <= 12]
+    if not eligible:
+        raise RuntimeError("No benchmark configuration fits the 12 GiB safety ceiling")
+    best = max(eligible, key=lambda row: row["queries_per_second"])
+    report = {"hardware": torch.cuda.get_device_name(device), "steps": steps,
+              "arm": "arcface_qkv", "recommendation": best, "measurements": rows}
+    out.mkdir(parents=True, exist_ok=True)
+    study._json(out / "hardware_benchmark.json", report)
+    return report
+
+
 def run():
     cfg = _config()
     root = Path(os.environ.get("ROOT_PATH", "/content/drive/MyDrive/NCS")).resolve()
-    out = Path(os.environ.get("WOOD_FULL_OUT", root / "results/wood_full_image_ablation_v2"))
+    out = Path(os.environ.get("WOOD_FULL_OUT", root / "results/wood_full_image_ablation_v3"))
     mode = os.environ.get("WOOD_FULL_MODE", "train")
     device = torch.device(os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
     if mode == "export":
@@ -374,19 +476,21 @@ def run():
             print(f"[wood-full] fold={fold} K=10 eligible: "
                   f"{len(queries)} queries / {len({label for _, label in pool})} species")
         return
-    if mode not in {"train", "validate"}:
-        raise ValueError("WOOD_FULL_MODE must be preflight, train, validate, or export")
+    if mode not in {"benchmark", "train", "validate"}:
+        raise ValueError("WOOD_FULL_MODE must be preflight, benchmark, train, validate, or export")
     source_root = Path(os.environ.get(
         "WOOD_FULL_SOURCE_OUT", root / "results/dinov2s_retrieval_matched_v1"))
     base_path, base_state, base_cfg = evidence._base_checkpoint(
         root, source_root, cfg["source_seed"])
+    if mode == "benchmark":
+        return _benchmark(out, items, base_state, base_cfg, cfg, device)
     if mode == "train" and os.environ.get("WOOD_FULL_PRELOAD", "1") == "1":
         data.preload_image_cache(
             (path for path, _ in items),
             max_workers=int(os.environ.get("WOOD_FULL_PRELOAD_WORKERS", "8")),
             desc="Full-image meta-train preload")
     recipe = {key: value for key, value in cfg.items()
-              if key not in {"arms", "seeds", "epochs", "print_every", "workers"}}
+              if key not in {"arms", "seeds", "epochs", "print_every"}}
     provenance = {"manifest_sha256": study._hash_file(root / "swi_manifest.json"),
                   "source_sha256": study._hash_file(base_path),
                   "runner_sha256": study._hash_file(__file__),
@@ -403,6 +507,14 @@ def run():
         study._json(existing_provenance, provenance)
     if mode == "validate":
         from . import wood_full_image_eval as evaluation
+        source_dir = out / "validation" / "source_global" / f"seed_{cfg['source_seed']}"
+        if not (source_dir / "summary.csv").exists():
+            encoder = evidence._encoder_from_state(base_state, base_cfg, device)
+            encoder.eval()
+            model = WoodCorrespondence().to(device).eval()
+            evaluation.evaluate(manifest, encoder, model, base_cfg, "source_global",
+                                device, source_dir, study._hash_file(base_path),
+                                provenance["manifest_sha256"])
         for arm in cfg["arms"]:
             for seed in cfg["seeds"]:
                 checkpoint = out / arm / f"seed_{seed}" / "best.pt"
@@ -441,6 +553,7 @@ def run():
                 {"params": model.parameters(), "lr": cfg["head_lr"]},
                 {"params": classifier.parameters(), "lr": cfg["head_lr"]},
             ], weight_decay=0.01)
+            scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
             latest = folder / "latest.pt"
             start_epoch, best_score = 1, -1.0
             if latest.is_file():
@@ -451,12 +564,16 @@ def run():
                 model.load_state_dict(saved["model"])
                 classifier.load_state_dict(saved["classifier"])
                 optimizer.load_state_dict(saved["optimizer"])
+                if scaler is not None:
+                    scaler.load_state_dict(saved["scaler"])
                 study._restore_rng(saved["rng_state"])
                 start_epoch = saved["epoch"] + 1
                 best_score = saved["best_score"]
                 print(f"[wood-full] resuming {arm} seed={seed} epoch={start_epoch}", flush=True)
             for epoch in range(start_epoch, cfg["epochs"] + 1):
-                refs, audit = reference_plan(items, seed, epoch)
+                refs, audit = reference_plan(
+                    items, seed, epoch, "random" if arm == "arcface_pair_nce_random"
+                    else "cross_scale")
                 dataset = PairDataset(items, refs)
                 sampler = (multi_positive_batches if arm in {
                     "arcface_packed", "arcface_multipos", "arcface_multipos_qkv"
@@ -466,7 +583,7 @@ def run():
                 loader = DataLoader(dataset, batch_sampler=batches,
                                     num_workers=cfg["workers"],
                                     pin_memory=device.type == "cuda",
-                                    persistent_workers=cfg["workers"] > 0)
+                                    prefetch_factor=2 if cfg["workers"] > 0 else None)
                 encoder.train()
                 model.train()
                 classifier.train()
@@ -489,7 +606,7 @@ def run():
                             image=dataset.loader.load(items[extra_index][0]))["image"]
                         extra = (extra_image, dataset.lookup[other])
                     loss, metrics = _step(encoder, model, classifier, batch, arm,
-                                          cfg, optimizer, device, extra)
+                                          cfg, optimizer, device, extra, scaler)
                     losses.append(loss)
                     candidate_classes.append(metrics["candidate_classes"])
                     positive_views.append(metrics["positive_views_per_anchor"])
@@ -521,6 +638,7 @@ def run():
                          "encoder": encoder.state_dict(), "model": model.state_dict(),
                          "classifier": classifier.state_dict(),
                          "optimizer": optimizer.state_dict(), "best_score": best_score,
+                         "scaler": scaler.state_dict() if scaler is not None else None,
                          "rng_state": study._rng_state()}
                 if improved:
                     study._save_checkpoint(folder / "best.pt", state)

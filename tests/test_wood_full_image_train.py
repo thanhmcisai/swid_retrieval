@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from swid_retrieval import wood_full_image_train as full
@@ -24,6 +25,17 @@ def test_reference_plan_covers_every_query_and_prefers_disjoint_scan():
     assert audit["cross_scan_pairs"] == 3
     assert audit["same_scan_fallback_pairs"] == 2
     assert np.all((refs >= 0) & (refs < len(items)))
+
+
+def test_random_scale_control_keeps_scan_constraint():
+    items = _items()
+    preferred, _ = full.reference_plan(items, 43, 1, "cross_scale")
+    random_refs, audit = full.reference_plan(items, 43, 1, "random")
+    assert len(preferred) == len(random_refs)
+    assert audit["cross_scan_pairs"] == 3
+    assert audit["scale_policy"] == "random"
+    with pytest.raises(ValueError, match="scale policy"):
+        full.reference_plan(items, 43, 1, "invalid")
 
 
 def test_class_balanced_batches_cover_full_dataset_once():
@@ -122,7 +134,8 @@ def test_single_class_query_uses_extra_negative_reference():
     assert tokens.grad is not None and tokens.grad.abs().sum() > 0
 
 
-def test_full_step_updates_encoder_and_qkv(monkeypatch):
+@pytest.mark.parametrize("mode", ["direct", "replay"])
+def test_full_step_updates_encoder_and_qkv(monkeypatch, mode):
     class TinyEncoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -146,7 +159,8 @@ def test_full_step_updates_encoder_and_qkv(monkeypatch):
     batch = (torch.randn(2, 3, 2, 2), torch.randn(2, 3, 2, 2),
              torch.tensor([0, 1]), torch.tensor([0, 1]))
     loss, metrics = full._step(encoder, model, classifier, batch, "arcface_qkv",
-                               {"microbatch": 2, "qkv_weight": 0.5}, optimizer,
+                               {"microbatch": 2, "qkv_weight": 0.5,
+                                "step_mode": mode}, optimizer,
                                torch.device("cpu"))
     assert np.isfinite(loss)
     assert metrics["candidate_classes"] == 2

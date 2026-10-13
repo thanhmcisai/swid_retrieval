@@ -197,7 +197,7 @@ def export_review(out):
     files = sorted(path for path in out.rglob("*") if path.is_file() and
                    (path.name.startswith("epoch_") and path.suffix == ".json" or
                     path.name in {"provenance.json", "summary.csv", "per_query.csv",
-                                  "protocol.json"}))
+                                  "protocol.json", "hardware_benchmark.json"}))
     if not any(path.name == "summary.csv" for path in files):
         raise ValueError("No validation summaries exist; run validate before export")
     archive = out / "wood_full_image_ablation_review.zip"
