@@ -319,7 +319,8 @@ def _step(encoder, model, classifier, batch, arm, cfg, optimizer, device,
     return float(loss.detach()), metrics
 
 
-def _validate_fold(manifest, encoder, model, base_cfg, arm, device, fold):
+def _validate_fold(manifest, encoder, model, base_cfg, arm, device, fold,
+                   galleries=("57x5", "57x1", "637x1")):
     refs, queries, extras = evidence._validation_sets(manifest, "meta-val", fold)
     plans = evidence._gallery_plan(refs, queries, extras, "meta-val")
     items = refs + extras
@@ -328,7 +329,7 @@ def _validate_fold(manifest, encoder, model, base_cfg, arm, device, fold):
     qg, qt = evidence._extract(encoder, queries, extract, device)
     results = {}
     with torch.no_grad():
-        for gallery in ("57x5", "57x1", "637x1"):
+        for gallery in galleries:
             ri, qi = plans[gallery]
             selected = [items[i] for i in ri]
             names = sorted({study.canonical(label) for _, label in selected})
@@ -367,8 +368,9 @@ def _validate_fold(manifest, encoder, model, base_cfg, arm, device, fold):
     return results
 
 
-def _validate(manifest, encoder, model, base_cfg, arm, device):
-    folds = [_validate_fold(manifest, encoder, model, base_cfg, arm, device, fold)
+def _validate(manifest, encoder, model, base_cfg, arm, device,
+              galleries=("57x5", "57x1", "637x1")):
+    folds = [_validate_fold(manifest, encoder, model, base_cfg, arm, device, fold, galleries)
              for fold in (0, 1)]
     return {key: float(np.mean([part[key] for part in folds])) for key in folds[0]}
 
@@ -583,7 +585,7 @@ def run():
                 loader = DataLoader(dataset, batch_sampler=batches,
                                     num_workers=cfg["workers"],
                                     pin_memory=device.type == "cuda",
-                                    prefetch_factor=2 if cfg["workers"] > 0 else None)
+                                    **({"prefetch_factor": 2} if cfg["workers"] > 0 else {}))
                 encoder.train()
                 model.train()
                 classifier.train()
